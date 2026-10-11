@@ -58,6 +58,14 @@
 
 - **权威签到走 `campaigns`**：这是唯一真实发放积分的接口，返回 `grantId` 可核验到账
 - **不依赖 `daily-check-in`**：该 legacy 端点在国内已 `DISABLED` 且对未领取日恒返回 `409`（会误判为已领取而漏领），海外则直接 `404`
+- **⚠️ 必须携带完整设备指纹**：国际版（`qoder.com`）的签到活动**按设备指纹下发**——
+  请求若缺少 `cosy-version` / `cosy-machineid` / `cosy-machinetoken` / `cosy-machinetype` /
+  `cosy-machinecode` / `cosy-machinehostname` / `cosy-machineos` 这 7 个头，
+  服务端会**不下发 `CLAIM_BENEFIT` 签到活动**，表现为「无可用签到活动」而无法领取。
+  本项目复用 Bridge 的同一套 `cosy.FingerprintSeed` 派生规则（uid 优先、凭证兜底），
+  保证签到与推理在同一账号上表现为同一台物理设备
+- **账号准入**：服务端按账号状态灰度下发签到活动。实测新注册账号（如当天创建）
+  即使携带完整指纹也不下发活动，需账号有一定使用记录后才可见
 - **领取窗口**：`10:00 → 次日 09:59 (UTC+8)`，窗口未开启时点击会明确提示下次开放时间
 - **连续天数本地统计**：上游 legacy 统计恒为 0，故由 qoder2api 记录 `checkin_history.json` 并按**活动窗口 `startAt` 日期**（而非自然日）计算，避免 10:00 前误记
 - **调度容错**：签到时刻若活动尚未下发，不标记当日完成，每分钟重试至 12:00，避免漏签
@@ -94,6 +102,13 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 - **双区域签到**（`b84c41b`）：`account.Endpoints` 新增 `OpenAPIHost`，签到域名按账号 `region` 自动路由
   （`cn` → `openapi.qoder.com.cn`，`global` → `openapi.qoder.sh`），
   同一控制台实例可同时管理国内版与国际版账号，无需分实例
+- **修复国际版签到不可用（重要）**：抓包对比官方客户端发现，国际版签到活动**按设备指纹下发**。
+  此前签到请求只带 `Authorization` + `cosy-clienttype`，缺少
+  `cosy-version` / `cosy-machineid` / `cosy-machinetoken` / `cosy-machinetype` /
+  `cosy-machinecode` / `cosy-machinehostname` / `cosy-machineos` 共 7 个头，
+  服务端因此不下发 `CLAIM_BENEFIT` 活动，表现为「无可用签到活动」。
+  现已复用 Bridge 的 `cosy.FingerprintSeed` 派生规则补齐全部指纹头，
+  国际版账号签到恢复正常（实测由 `no_campaign` 变为可领取并成功到账）
 - **修复空签到（重要）**：`daily-check-in/claim` 在国内已 `DISABLED`，却对**未领取日也恒返回 409**
   （被误读为「已领取」而跳过真实领取）；海外该端点直接 404。
   现已**彻底移除**对它的领取调用，`campaigns` 成为唯一权威签到路径（返回 `grantId` 可核验到账）

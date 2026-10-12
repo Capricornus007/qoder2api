@@ -95,7 +95,84 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 
 ## 更新记录
 
+### 🏗️ 架构：单控制台 + 双桥端口（CN 8963 / Global 8964）
+
+**2026-10-10 21:20 CST** · [`6199925`](https://github.com/Zhengyuuuui/qoder2api/commit/6199925)
+
+Global Web 控制台（3589）闲置但其 Bridge 链路仍需保留，故将两个 Bridge 合并到同一控制台实例：
+
+- 新增 `--global-port`（默认 `8964`，传 `0` 关闭）
+- `--instance=cn` 单进程启动 `console 3588 + bridge 8963 + bridge 8964`
+- `8964` 使用 Global 专用账号池；`8963` 保留全量池并按模型 region 路由（见下方跨区修复）
+- `--instance=global` 保留为独立兜底模式（`3589 + 8964`）
+
+---
+
+### 🐛 修复：请求跨区域路由导致误扣 Global 账号额度
+
+**2026-10-12 21:31 CST** · [`f4b22a0`](https://github.com/Zhengyuuuui/qoder2api/commit/f4b22a0)
+
+**问题现象**
+
+单控制台 + 双桥改造后，CN 桥（8963）把请求派给了 **Global 账号**并扣除其 Credits。
+实测 `yusheng zheng`（国际版）在客户端未启动的情况下被消耗 549 Credits。
+
+**根因**
+
+8963 使用 `buildAccountPool()` 构建账号池，**不区分 region**，CN 与 Global 账号混在一起。
+选号逻辑 `pickSlotForModel` 只检查模型的**目录归属**，从不检查账号的 **region**：
+
+```go
+// ❌ 修复前
+slot, ok := b.pool.Pick(exclude, func(s *Slot) bool {
+    return b.slotSupportsModel(s, model)   // 只看模型目录，不看 region
+})
+if ok { return slot, true }
+return b.pool.Pick(exclude)               // 兜底完全不看 region
+```
+
+由于 `qmodel_38max` / `qfmodel` 等模型在**两个区域的目录中都存在**，
+CN 请求因此会被匹配到 Global 账号并扣费。
+
+**修复内容**
+
+| 文件 | 修改 |
+|------|------|
+| `service.go` | 8963 改用 `buildRegionPool(acct.Region)`，池内只含同区域账号；8964 保持 Global 专用池；删除已无调用者的 `buildAccountPool()` |
+| `internal/bridge/bridge_pool.go` | 新增 `NewPoolBridgeFor(region, pool, tmpl)` 将区域绑定到 Bridge；选号的**目录匹配**与**兜底**均增加 region 过滤，杜绝跨区选号 |
+| `internal/bridge/bridge.go` | 日志新增账号名 / ID / region / 模型 |
+
+**端口与账号的隔离关系**（修复后）：
+
+```
+console 3588    管理全部账号
+bridge  8963    region=cn      仅使用 region=cn 的账号
+bridge  8964    region=global  仅使用 region=global 的账号
+```
+
+**排查用日志**
+
+每次调用上游都会记录实际使用的账号，便于核对扣费归属：
+
+```bash
+# 查看某次请求实际用了哪个账号
+grep "using account" ~/.qoder2api-cn/logs/qccg-*.log
+
+# 排查是否有跨区误用（应只出现在 8964 侧）
+grep "using account" ~/.qoder2api-cn/logs/qccg-*.log | grep region=global
+```
+
+输出示例：
+
+```
+callQoder region=cn model=gmodel prompt=hi
+callQoder: using account=nick8034851628 id=acct1789... region=cn model=gmodel
+callQoder: account=yusheng zheng id=zysgm... region=global failed, failing over to next account: ...
+```
+
 ### 签到：支持 Global 国际版 + 修复「显示签到但没到账」
+
+**2026-10-10 ~ 2026-10-11** · [`b84c41b`](https://github.com/Zhengyuuuui/qoder2api/commit/b84c41b) 双区域 · [`fcde08e`](https://github.com/Zhengyuuuui/qoder2api/commit/fcde08e) 可配置时间 · [`2cd2ccd`](https://github.com/Zhengyuuuui/qoder2api/commit/2cd2ccd) 设备指纹
 
 > 本节特性由社区贡献者 [@LeonardW-sl](https://github.com/LeonardW-sl) 主导实现，详见文首[致谢](#🙏-特别致谢--贡献者)。
 
@@ -121,6 +198,8 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 - **签到时间可配置**（`fcde08e`）：`auto_checkin_times` 支持多时段（HH:MM 列表），留空默认 `10:00`
 
 ### 流稳定性 / 错误分类 / 安全加固
+
+**2026-10-07 20:56 CST** · [`be38b8f`](https://github.com/Zhengyuuuui/qoder2api/commit/be38b8f)（合并 `LeonardW-sl` 多账号池 / 图片输入 / 区域路由）
 
 **上游流处理（对齐 hub 行为）**
 
@@ -175,12 +254,32 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 
 ## 端口
 
-| 实例 | Web 控制台 | Bridge API | 数据目录 | Region |
-|------|------------|------------|----------|--------|
-| **CN 国内**（默认） | `3588` | `8963` | `~/.qoder2api` 或 `~/.qoder2api-cn` | 控制台选 `cn` |
-| **Global 国际** | `3589` | `8964` | `~/.qoder2api-global` | 控制台选 `global` |
+**默认（`--instance=cn`，推荐）**：单进程同时提供控制台与两个 Bridge
 
-单实例默认仍是 `3588` + `8963`。双开请用 `--instance`：
+| 服务 | 端口 | 说明 |
+|------|------|------|
+| Web 控制台 | `3588` | **唯一控制台**，管理全部账号（CN + Global） |
+| Bridge（CN） | `8963` | 仅使用 `region=cn` 账号，按模型 region 路由 |
+| Bridge（Global） | `8964` | 仅使用 `region=global` 账号，可通过 `--global-port=0` 关闭 |
+
+数据目录：`~/.qoder2api-cn`（账号集中存放，按 `region` 字段区分归属）
+
+客户端接入：
+
+- CN 用户 → `http://<host>:8963/v1`
+- Global 用户 → `http://<host>:8964/v1`
+
+<details>
+<summary>兼容模式：独立 Global 实例（通常不需要）</summary>
+
+| 实例 | Web 控制台 | Bridge API | 数据目录 |
+|------|------------|------------|----------|
+| `--instance=cn` | `3588` | `8963` + `8964` | `~/.qoder2api-cn` |
+| `--instance=global` | `3589` | `8964` | `~/.qoder2api-global` |
+
+</details>
+
+双开请用 `--instance`：
 
 ```bash
 # 国内
@@ -222,7 +321,8 @@ GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o qoder2api .
 | `--bridge-port` | `8963` | Bridge API 端口 |
 | `--bind` | `0.0.0.0` | 控制台监听地址 |
 | `--data-dir` | `~/.qoder2api` | 数据根目录（账号/密钥隔离） |
-| `--instance` | 空 | `cn`→3588/8963；`global`→3589/8964，并分数据目录 |
+| `--instance` | 空 | `cn`→3588 + 8963 + 8964；`global`→3589 + 8964（独立模式） |
+| `--global-port` | `8964` | Global 专用桥端口；`0` = 不启动 |
 | 环境变量 `QODER2API_HOME` | — | 等同 `--data-dir` |
 | 环境变量 `QODER2API_CONSOLE_PASSWORD` | — | 控制台登录密码 |
 

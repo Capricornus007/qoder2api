@@ -242,15 +242,18 @@ func (s *Service) startBridgeWithAccount(acct *account.Account) error {
 	var templateBase map[string]interface{}
 	_ = json.Unmarshal([]byte(tmpl), &templateBase)
 
-	// 账号池：把所有有凭证的账号都纳入。请求时轮询选号，某个账号限额/限流/
-	// 瞬时故障时冷却该账号并自动换下一个（见 internal/bridge/pool.go）。
-	pool := s.buildAccountPool()
+	// 主桥账号池：只纳入与本桥区域一致的账号。
+	// 必须按 region 隔离：若把 global 账号也放进 8963 的池，模型目录命中
+	// （如 qmodel_38max / qfmodel 两区都有）会把请求派给 global 账号并扣其 credits，
+	// 而用户可能根本没启动 global 侧。请求时轮询选号，限额/限流/瞬时故障时
+	// 冷却该账号并自动换下一个（见 internal/bridge/pool.go）。
+	pool := s.buildRegionPool(acct.Region)
 	if pool.Size() == 0 {
-		return fmt.Errorf("no account with usable secret; please OAuth/PAT login in web console")
+		return fmt.Errorf("no %s account with usable secret; please OAuth/PAT login in web console", acct.Region)
 	}
-	logger.Info("startBridgeWithAccount: pool size=%d (requested active=%s)", pool.Size(), acct.Name)
+	logger.Info("startBridgeWithAccount: region=%s pool size=%d (requested active=%s)", acct.Region, pool.Size(), acct.Name)
 
-	b := bridge.NewPoolBridge(pool, templateBase)
+	b := bridge.NewPoolBridgeFor(acct.Region, pool, templateBase)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", b.HandleChatCompletions)
@@ -294,7 +297,7 @@ func (s *Service) startGlobalBridge(templateBase map[string]interface{}) error {
 	if pool.Size() == 0 {
 		return fmt.Errorf("no global account with usable secret")
 	}
-	b := bridge.NewPoolBridge(pool, templateBase)
+	b := bridge.NewPoolBridgeFor(account.RegionGlobal, pool, templateBase)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", b.HandleChatCompletions)
@@ -318,37 +321,6 @@ func (s *Service) startGlobalBridge(templateBase map[string]interface{}) error {
 		}
 	}()
 	return nil
-}
-
-// buildAccountPool 把所有有 secret 的账号建成运行时账号池。
-// 单个账号建会话失败（凭证失效/网络等）只跳过该账号，不阻断整池启动。
-func (s *Service) buildAccountPool() *bridge.Pool {
-	pool := bridge.NewPoolWithState(filepath.Join(account.DataRoot(), "pool_state.json"))
-	accounts, err := account.List()
-	if err != nil {
-		logger.Error("buildAccountPool: list accounts: %v", err)
-		return pool
-	}
-	for _, a := range accounts {
-		if !account.HasSecret(a.ID) {
-			continue
-		}
-		pat, err := account.GetSecret(a.ID)
-		if err != nil {
-			logger.Error("buildAccountPool: get secret for %s: %v", a.Name, err)
-			continue
-		}
-		slot, err := bridge.NewSlotFromSecret(a.ID, a.Name, a.Region, pat)
-		if err != nil {
-			logger.Error("buildAccountPool: account %s unusable, skipped: %v", a.Name, err)
-			continue
-		}
-		pool.Add(slot)
-		logger.Info("buildAccountPool: added account %s (region=%s)", a.Name, a.Region)
-	}
-	// 账号全部入池后再恢复冷却状态（构造时空池 load 匹配不到 ID）。
-	pool.LoadState()
-	return pool
 }
 
 // buildRegionPool 只把指定区域的账号建成池（用于 8964 Global 专用桥）。

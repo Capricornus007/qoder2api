@@ -406,7 +406,7 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	if len(prompt) > 80 {
 		preview = preview[:80] + "..."
 	}
-	logger.Info("callQoder model=%s prompt=%s", model, preview)
+	logger.Info("callQoder region=%s model=%s prompt=%s", b.region, model, preview)
 
 	// ---- 账号池选号 + 失败换号 -------------------------------------------
 	// 逐个尝试池内账号：某账号失败且「尚未向客户端发出任何内容」、且错误属于
@@ -419,7 +419,10 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		if !ok {
 			break
 		}
-		logger.Info("callQoder: using account %s (%s)", slot.Name, slot.ID)
+		// 记录本次实际使用的账号（含 region），便于对账与排查
+		// 「请求是否路由到了未启动的那一侧账号」类问题。
+		logger.Info("callQoder: using account=%s id=%s region=%s model=%s",
+			slot.Name, slot.ID, slot.Region, model)
 		// 每个账号用全新的请求 id / session，避免跨账号复用同一标识
 		nid := cosy.NewUUID()
 		body["request_id"] = nid
@@ -449,7 +452,8 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		}
 		b.coolSlot(slot.ID, CooldownFor(err), err.Error())
 		tried[slot.ID] = struct{}{}
-		logger.Info("callQoder: account %s failed, failing over to next account: %v", slot.ID, err)
+		logger.Info("callQoder: account=%s id=%s region=%s failed, failing over to next account: %v",
+			slot.Name, slot.ID, slot.Region, err)
 	}
 	if lastErr == nil {
 		lastErr = ErrNoAccount

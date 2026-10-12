@@ -21,6 +21,11 @@ func NewPoolBridge(pool *Pool, templateBase map[string]interface{}) *Bridge {
 	return &Bridge{pool: pool, templateBase: templateBase}
 }
 
+// NewPoolBridgeFor 指定本桥 region，用于选号时拒绝跨区账号。
+func NewPoolBridgeFor(region account.Region, pool *Pool, templateBase map[string]interface{}) *Bridge {
+	return &Bridge{pool: pool, templateBase: templateBase, region: region}
+}
+
 // candidateSlots 返回当前可参与选号的账号：池优先；无池时退化为单账号
 // （保持既有单账号构造方式与测试兼容）。
 func (b *Bridge) candidateSlots() []*Slot {
@@ -108,17 +113,38 @@ func (b *Bridge) slotSupportsModel(slot *Slot, model string) bool {
 	return slot.catalog[model]
 }
 
-// pickSlotForModel 按模型选号：优先选目录里有该模型的账号；都没有则退回任意可用账号。
+// pickSlotForModel 按模型选号：优先选目录里有该模型的同 region 账号。
+// 兜底同样限定同 region——跨 region 会把请求派给别区账号并扣其 credits
+// （实测 8963 曾把 CN 请求派给 global 账号产生扣费）。
 func (b *Bridge) pickSlotForModel(model string, exclude map[string]struct{}) (*Slot, bool) {
+	// 本桥期望的区域：Bridge.region（单账号模式天然有值）；
+	// 池模式若 region 为空则回退到池内首个 slot。
+	wantRegion := b.region
+	if wantRegion == "" && b.pool != nil {
+		b.pool.mu.Lock()
+		for _, s := range b.pool.slots {
+			wantRegion = s.Region
+			break
+		}
+		b.pool.mu.Unlock()
+	}
+	// 防御性过滤：即使池被误构建为跨区，也不选别区账号
+	// （跨区会扣到用户根本没启动的那侧账号的 credits）。
+	sameRegion := func(s *Slot) bool { return wantRegion == "" || s.Region == wantRegion }
+
 	if b.pool == nil {
 		return b.pickSlot(exclude)
 	}
 	slot, ok := b.pool.Pick(exclude, func(s *Slot) bool {
+		if !sameRegion(s) {
+			return false
+		}
 		b.ensureCatalog(s)
 		return b.slotSupportsModel(s, model)
 	})
 	if ok {
 		return slot, true
 	}
-	return b.pool.Pick(exclude)
+	// 池内同 region 账号目录均不含该模型：仍在同 region 内兜底。
+	return b.pool.Pick(exclude, sameRegion)
 }

@@ -2,23 +2,19 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"qoder2api/account"
-	"qoder2api/internal/cosy"
 	"qoder2api/logger"
 )
 
@@ -72,79 +68,32 @@ var checkinClient = &http.Client{
 }
 
 // checkinHeaders 构造桌面端签到请求头（抓包确认的必需头）
-// checkinFP 承载签到请求所需的设备指纹字段。
-// 国际版（qoder.com）实测：campaigns 活动下发需完整设备指纹头，
-// 缺失会导致服务端不下发 CLAIM_BENEFIT 签到活动（表现为 no_campaign）。
-type checkinFP struct {
-	machineID    string
-	machineToken string
-	machineType  string
-	machineCode  string
-	hostname     string
-	machineOS    string
-	version      string
-}
-
-// newCheckinFP 用与 Bridge 相同的 seed 规则派生指纹，
-// 保证签到与推理在同一账号上表现为同一台物理设备。
-func newCheckinFP(uid, pat string) checkinFP {
-	seed := cosy.FingerprintSeed(uid, pat)
-	fp := checkinFP{
-		machineID:    cosy.DeriveMachineID(seed),
-		machineToken: cosy.DeriveMachineToken(seed),
-		machineType:  cosy.DeriveMachineType(seed),
-		hostname:     "localhost",
-		machineOS:    goOS(),
-		version:      "0.4.4", // 对齐国际版桌面端
-	}
-	fp.machineCode = machineCodeFrom(fp.machineID)
-	return fp
-}
-
-// goOS 返回与官方客户端一致的 machineos 格式，如 aarch64_darwin
-func goOS() string {
-	arch := "x86_64"
-	if runtime.GOARCH == "arm64" {
-		arch = "aarch64"
-	}
-	osName := "linux"
-	switch runtime.GOOS {
-	case "darwin":
-		osName = "darwin"
-	case "windows":
-		osName = "windows"
-	}
-	return arch + "_" + osName
-}
-
-// machineCodeFrom 由 machineid 派生 16 位十六进制 machinecode（官方格式）
-func machineCodeFrom(machineID string) string {
-	sum := sha256.Sum256([]byte("cosy-machine-code:" + machineID))
-	return hex.EncodeToString(sum[:])[:16]
-}
-
 // checkinHeaders 构造签到请求头。
 // 必须携带完整 cosy 设备指纹：国际版缺少这些头时服务端不下发签到活动。
-func checkinHeaders(deviceToken string, fp checkinFP) map[string]string {
+// checkinHeaders 构造签到请求头。
+//
+// 关键结论（2026-10-13 实测）：
+//   - `cosy-machinetoken` 是**服务端签发**的设备令牌，客户端自造的任何值
+//     （无论长度/格式是否正确）都会导致服务端不下发 CLAIM_BENEFIT 签到活动，
+//     表现为「无可用签到活动」。空值（不发送该头）反而放行。
+//   - 同一实验证明 machineid / machinetype / machinecode / hostname / os
+//     的取值均不影响活动下发。
+//
+// 因此签到**只发送必要头**：auth + clienttype + 通用 UA/语言，
+// **刻意不发** cosy-machinetoken 及其余自造指纹，避免被判定为伪造设备。
+func checkinHeaders(deviceToken string) map[string]string {
 	return map[string]string{
-		"authorization":        "Bearer " + deviceToken,
-		"accept":               "application/json",
-		"accept-language":      "zh-CN",
-		"user-agent":           "Qoder",
-		"cosy-clienttype":      "10",
-		"cosy-version":         fp.version,
-		"cosy-machineid":       fp.machineID,
-		"cosy-machinetoken":    fp.machineToken,
-		"cosy-machinetype":     fp.machineType,
-		"cosy-machinecode":     fp.machineCode,
-		"cosy-machinehostname": fp.hostname,
-		"cosy-machineos":       fp.machineOS,
+		"authorization":   "Bearer " + deviceToken,
+		"accept":          "application/json",
+		"accept-language": "zh-CN",
+		"user-agent":      "Qoder",
+		"cosy-clienttype": "10",
 	}
 }
 
 // doCheckinRequest 发送签到相关请求，返回 (httpStatus, parsedJSON, rawBody)
 // reqBody 为 nil 时发送空 body（抓包确认 campaigns/claim 即为空 body）
-func doCheckinRequest(method, path, deviceToken string, reqBody interface{}, host string, fp checkinFP) (int, interface{}, string) {
+func doCheckinRequest(method, path, deviceToken string, reqBody interface{}, host string) (int, interface{}, string) {
 	if host == "" {
 		host = checkinHost
 	}
@@ -160,7 +109,7 @@ func doCheckinRequest(method, path, deviceToken string, reqBody interface{}, hos
 	if err != nil {
 		return 0, nil, fmt.Sprintf("build request: %v", err)
 	}
-	for k, v := range checkinHeaders(deviceToken, fp) {
+	for k, v := range checkinHeaders(deviceToken) {
 		req.Header.Set(k, v)
 	}
 	if method == "POST" {
@@ -387,11 +336,10 @@ func checkinAccount(acct *account.Account) CheckinResult {
 	host := checkinHostFor(acct.Region)
 	// 指纹 seed 优先用账号 ID（签到不做 userinfo 往返，且账号 ID 稳定唯一），
 	// 退回凭证种子，与 Bridge 的 uid 派生保持同一套设备身份。
-	fp := newCheckinFP(acct.ID, secret)
-	r := campaignsCheckin(deviceToken, &res, host, fp)
+	r := campaignsCheckin(deviceToken, &res, host)
 
 	// 只读补充 legacy 统计（DISABLED 时恒 0，不影响结果；上游恢复后可提供 streak）
-	readDailyCheckinStats(deviceToken, &r, host, fp)
+	readDailyCheckinStats(deviceToken, &r, host)
 
 	return finalizeCheckin(acct.ID, r)
 }
@@ -422,8 +370,8 @@ func finalizeCheckin(accountID string, r CheckinResult) CheckinResult {
 // 背景：该端点的 legacy 活动已 DISABLED，claim 会恒返回 409 造成误判，
 // 且不发放任何积分（2026-09-21 实测）。真实领取只走 campaigns 流程。
 // 上游恢复后若返回非 0 统计，可作为 streak 的补充数据源。
-func readDailyCheckinStats(deviceToken string, res *CheckinResult, host string, fp checkinFP) {
-	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/daily-check-in/status", deviceToken, nil, host, fp)
+func readDailyCheckinStats(deviceToken string, res *CheckinResult, host string) {
+	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/daily-check-in/status", deviceToken, nil, host)
 	if status != 200 {
 		if status != 404 && status != 401 {
 			logger.Info("[Checkin] daily-check-in/status HTTP %d: %s", status, truncate(raw, 150))
@@ -489,9 +437,9 @@ func windowHint(res *CheckinResult, fallback string) string {
 }
 
 // campaignsCheckin 兜底：走桌面端抓包还原的 campaigns 流程
-func campaignsCheckin(deviceToken string, res *CheckinResult, host string, fp checkinFP) CheckinResult {
+func campaignsCheckin(deviceToken string, res *CheckinResult, host string) CheckinResult {
 	// Step 1: 查询活动列表
-	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/campaigns", deviceToken, nil, host, fp)
+	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/campaigns", deviceToken, nil, host)
 	if status != 200 {
 		res.Message = fmt.Sprintf("查询活动失败 HTTP %d: %s", status, truncate(raw, 300))
 		return *res
@@ -554,7 +502,7 @@ func campaignsCheckin(deviceToken string, res *CheckinResult, host string, fp ch
 
 	// Step 2: 领取（空 body，抓包确认）
 	claimPath := fmt.Sprintf("/sash/api/v1/me/campaigns/%s/claim", target.CampaignID)
-	status, body, raw = doCheckinRequest("POST", claimPath, deviceToken, nil, host, fp)
+	status, body, raw = doCheckinRequest("POST", claimPath, deviceToken, nil, host)
 	if status != 200 {
 		res.Message = fmt.Sprintf("领取失败 HTTP %d: %s", status, truncate(raw, 300))
 		return *res

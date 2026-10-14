@@ -172,7 +172,7 @@
   <header>
     <div>
       <h1>qoder2api</h1>
-      <div class="muted">轻量 Bridge + Web · CN 3588/8963 · Global 3589/8964</div>
+      <div class="muted">单控制台 · 双桥常驻：国内版 CN 8963 ＋ 国际版 Global 8964 同时可用</div>
     </div>
     <div class="row">
       <span class="pill"><span id="statusDot" class="dot"></span><span id="statusText">checking</span></span>
@@ -183,8 +183,16 @@
 
   <main>
     <section class="card">
-      <h3>状态</h3>
+      <h3>状态 · 双桥</h3>
       <div class="row" id="statusMeta"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="secondary" id="startAllBtn">启动两侧</button>
+        <button class="secondary" id="stopAllBtn">停止两侧</button>
+        <span class="msg" id="bridgeMsg"></span>
+      </div>
+      <div class="muted" style="margin-top:8px; font-size:12px">
+        两侧互不影响：停一侧、切一侧的账号，另一侧的在途请求不会被打断。
+      </div>
     </section>
 
     <section class="card">
@@ -250,7 +258,14 @@
 
     <section class="card grid-2">
       <div>
-        <h3>模型</h3>
+        <h3>模型 <span class="muted" id="modelsRegionHint"></span></h3>
+        <div class="row" style="margin-bottom:8px">
+          <select id="modelsRegion" style="width:150px">
+            <option value="cn">国内版 CN</option>
+            <option value="global">国际版 Global</option>
+          </select>
+          <button class="secondary" id="modelsRefreshBtn">重新拉取</button>
+        </div>
         <div id="modelsBox">加载中...</div>
       </div>
       <div>
@@ -263,6 +278,19 @@
       <h3>NewAPI / 中转站接入</h3>
       <div class="muted" style="margin-bottom:12px">
         把下面地址和密钥填到 NewAPI 渠道（OpenAI 兼容）。本地默认只监听 127.0.0.1。
+      </div>
+      <div class="grid-2">
+        <div>
+          <label>要接入的桥（区域）</label>
+          <select id="connRegion">
+            <option value="cn">国内版 CN</option>
+            <option value="global">国际版 Global</option>
+          </select>
+        </div>
+        <div>
+          <label>该侧状态</label>
+          <div class="muted" id="connRegionState" style="padding-top:10px">-</div>
+        </div>
       </div>
       <div class="grid-2">
         <div>
@@ -280,7 +308,8 @@
           </div>
         </div>
       </div>
-      
+      <div class="muted" id="dualUrlHint" style="margin-top:8px; font-size:12px"></div>
+
       <div style="margin-top:16px">
         <div>
           <label>API Key / 密钥（可修改）</label>
@@ -292,8 +321,17 @@
         </div>
         
         <div style="margin-top:12px">
-          <label>Bridge 端口（可修改）</label>
-          <input id="bridgePortInput" type="number" min="1" max="65535" placeholder="8963" />
+          <label>双桥端口（0 = 停用该侧；两侧不可同值）</label>
+          <div class="row">
+            <div style="flex:1">
+              <label class="muted" style="font-size:11px">CN</label>
+              <input id="cnPortInput" type="number" min="0" max="65535" placeholder="8963" />
+            </div>
+            <div style="flex:1">
+              <label class="muted" style="font-size:11px">Global</label>
+              <input id="globalPortInput" type="number" min="0" max="65535" placeholder="8964" />
+            </div>
+          </div>
         </div>
         
         <div style="margin-top:12px">
@@ -337,38 +375,90 @@
       return data;
     }
 
-    function setStatus(running, extra = {}) {
-      $('statusDot').classList.toggle('on', !!running);
-      $('statusText').textContent = running ? 'Bridge running' : 'Bridge stopped';
-      $('statusMeta').innerHTML = `
-        <span class="pill">Bridge: ${running ? 'ON' : 'OFF'}</span>
-        <span class="pill">Port: ${extra.port || 8963}</span>
-        <span class="pill">Active: ${extra.active_account || '-'}</span>
-        <span class="pill">API: ${extra.api_mode || '-'}</span>
-      `;
+    let lastStatus = { bridges: [] };
+    let lastConn = {};
+
+    function bridgeState(region) {
+      return (lastStatus.bridges || []).find(b => b.region === region) || {};
+    }
+
+    function setStatus(status) {
+      lastStatus = status || { bridges: [] };
+      const bridges = lastStatus.bridges || [];
+      const anyRunning = bridges.some(b => b.running);
+      $('statusDot').classList.toggle('on', anyRunning);
+      $('statusText').textContent = anyRunning ? '桥在线' : 'Bridge stopped';
+      $('statusMeta').innerHTML = bridges.map(b => `
+        <div class="pill" style="display:inline-flex; gap:10px; align-items:center; border-color:${b.running ? '#8bc34a' : '#e6b800'}">
+          <strong>${b.label || b.region}</strong>
+          <span>:${b.port || '-'}</span>
+          <span>${b.running ? 'ON' : 'OFF'}</span>
+          <span>可用账号 ${b.accounts_total || 0} · 池内 ${b.pool_size || 0}</span>
+          <span>激活 ${b.active_account || '-'}</span>
+          <button class="secondary" type="button" data-bridge-act="start" data-region="${b.region}" ${b.running ? 'disabled' : ''}>启动</button>
+          <button class="secondary" type="button" data-bridge-act="stop" data-region="${b.region}" ${b.running ? '' : 'disabled'}>停止</button>
+        </div>
+      `).join('') + bridges.filter(b => !b.running && b.reason).map(b => `<div class="muted" style="font-size:12px">${b.label}: ${b.reason}</div>`).join('');
+      refreshConnState();
+    }
+
+    function refreshConnState() {
+      const region = $('connRegion') ? $('connRegion').value : 'cn';
+      const st = bridgeState(region);
+      const stateEl = $('connRegionState');
+      if (stateEl) {
+        stateEl.textContent = st.running
+          ? `监听中 · :${st.port} · 池 ${st.pool_size || 0} 个账号`
+          : `未监听 · ${st.reason || '尚未启动'}`;
+      }
+      const hint = $('modelsRegionHint');
+      if (hint) hint.textContent = `（${region === 'cn' ? '国内版 CN' : '国际版 Global'}）`;
     }
 
     function fillConnection(conn = {}, settings = {}) {
-      const port = conn.port || settings.port || 8963;
+      lastConn = conn || {};
       const key = conn.api_key || settings.bridge_token || 'qccg';
-      const root = conn.base_url || `http://127.0.0.1:${port}`;
-      const openai = conn.openai_base_url || `${root}/v1`;
-      $('rootBaseUrl').value = root;
-      $('openaiBaseUrl').value = openai;
+      const regions = conn.regions || {};
+      const cn = regions.cn || {};
+      const gl = regions.global || {};
       if (document.activeElement !== $('bridgeTokenInput')) {
         $('bridgeTokenInput').value = key;
       }
-      if (document.activeElement !== $('bridgePortInput')) {
-        $('bridgePortInput').value = port;
+      if (document.activeElement !== $('cnPortInput')) {
+        $('cnPortInput').value = (cn.port != null ? cn.port : settings.cn_port != null ? settings.cn_port : 8963);
+      }
+      if (document.activeElement !== $('globalPortInput')) {
+        $('globalPortInput').value = (gl.port != null ? gl.port : settings.global_port != null ? settings.global_port : 8964);
+      }
+
+      const region = $('connRegion') ? $('connRegion').value : 'cn';
+      applyConnRegion(region);
+    }
+
+    // applyConnRegion 只刷新「所选区域的地址/配置/状态」，不碰端口输入框，
+    // 避免用户正在改端口时切换区域把已输入的值冲掉。
+    function applyConnRegion(region) {
+      const regions = (lastConn && lastConn.regions) || {};
+      const picked = regions[region] || {};
+      const key = (lastConn && lastConn.api_key) || 'qccg';
+      $('rootBaseUrl').value = picked.base_url || '-';
+      $('openaiBaseUrl').value = picked.openai_base_url || '-';
+      const other = region === 'cn' ? 'global' : 'cn';
+      const otherInfo = regions[other] || {};
+      const dual = $('dualUrlHint');
+      if (dual) {
+        dual.textContent = `另一侧（${otherInfo.label || other}）：` +
+          (otherInfo.enabled ? otherInfo.openai_base_url : '已停用（端口 0）');
       }
       const cfg = {
-        name: 'QCCG / Qoder',
+        name: `Qoder ${region === 'cn' ? '国内版 CN' : '国际版 Global'}`,
         type: 'openai',
-        base_url: openai,
+        base_url: picked.openai_base_url || '',
         api_key: key,
         models: ['auto', 'qmodel_38max', 'qfmodel', 'qmodel_latest', 'qmodel', 'q37fmodel', 'dmodel', 'dfmodel', 'gmodel', 'gfmodel', 'gm51model', 'kmodel_latest', 'kmodel', 'mmodel'],
       };
       $('newapiBox').textContent = JSON.stringify(cfg, null, 2);
+      refreshConnState();
     }
 
     async function loadConnection() {
@@ -529,7 +619,8 @@
 
     function renderAccounts(list, pool) {
       const poolById = {};
-      ((pool && pool.slots) || []).forEach(s => { poolById[s.id] = s; });
+      const pools = (pool && pool.pools) || [];
+      pools.forEach(p => (p.slots || []).forEach(s => { poolById[s.id] = s; }));
       if (!list || !list.length) {
         $('accountBody').innerHTML = '<tr><td colspan="4" class="muted">暂无账号</td></tr>';
         return;
@@ -579,12 +670,25 @@
       if (cell) cell.innerHTML = renderQuota(quotaCache[id]);
     }
 
+    async function loadModels() {
+      const region = $('modelsRegion') ? $('modelsRegion').value : 'cn';
+      $('modelsBox').textContent = '加载中...';
+      try {
+        const res = await api('/api/models?region=' + encodeURIComponent(region));
+        const models = Array.isArray(res) ? res : (res && res.data) || [];
+        $('modelsBox').innerHTML = renderModelsTable(models);
+      } catch (e) {
+        $('modelsBox').textContent = e.message;
+      }
+      refreshConnState();
+    }
+
     async function refresh() {
       try {
         const status = await api('/api/status');
-        setStatus(!!status.running, status);
+        setStatus(status);
       } catch (e) {
-        setStatus(false, {});
+        setStatus({});
       }
 
       await loadConnection();
@@ -600,13 +704,7 @@
         $('accountBody').innerHTML = `<tr><td colspan="4" class="msg err">${e.message}</td></tr>`;
       }
 
-      try {
-        const res = await api('/api/models');
-        const models = Array.isArray(res) ? res : (res && res.data) || [];
-        $('modelsBox').innerHTML = renderModelsTable(models);
-      } catch (e) {
-        $('modelsBox').textContent = e.message;
-      }
+      await loadModels();
 
       try {
         const logs = await api('/api/logs');
@@ -623,6 +721,35 @@
     }).catch(() => location.replace('/login.html'));
 
     $('refreshBtn').onclick = refresh;
+
+    // 双桥控制：区域下拉、模型按区拉取、单侧启停
+    $('connRegion').onchange = () => applyConnRegion($('connRegion').value);
+    $('modelsRegion').onchange = loadModels;
+    $('modelsRefreshBtn').onclick = loadModels;
+
+    async function controlBridge(act, region) {
+      $('bridgeMsg').className = 'msg';
+      $('bridgeMsg').textContent = `${region || '两侧'} ${act === 'start' ? '启动' : '停止'}中...`;
+      try {
+        const q = region ? '?region=' + encodeURIComponent(region) : '';
+        const res = await api('/api/bridge/' + act + q, { method: 'POST', body: '{}' });
+        if (res && res.bridges) setStatus(res);
+        $('bridgeMsg').className = 'msg ok';
+        $('bridgeMsg').textContent = '已完成';
+        await refresh();
+      } catch (e) {
+        $('bridgeMsg').className = 'msg err';
+        $('bridgeMsg').textContent = e.message;
+      }
+    }
+
+    $('statusMeta').onclick = (ev) => {
+      const btn = ev.target.closest('[data-bridge-act]');
+      if (!btn) return;
+      controlBridge(btn.getAttribute('data-bridge-act'), btn.getAttribute('data-region'));
+    };
+    $('startAllBtn').onclick = () => controlBridge('start', '');
+    $('stopAllBtn').onclick = () => controlBridge('stop', '');
     $('checkinBtn').onclick = async () => {
       $('checkinBtn').disabled = true;
       $('checkinMsg').className = 'msg';
@@ -691,8 +818,26 @@
     };
 
     $('saveConnBtn').onclick = async () => {
-      const port = Number($('bridgePortInput').value || 8963);
+      const cn_port = Number($('cnPortInput').value || 8963);
+      const global_port = Number($('globalPortInput').value || 8964);
       const bridge_token = ($('bridgeTokenInput').value || '').trim() || 'qccg';
+      if (!Number.isFinite(cn_port) || !Number.isFinite(global_port)) {
+        alert('端口必须是数字（0 = 停用该侧）');
+        return;
+      }
+      if ((cn_port !== 0 && (cn_port < 1 || cn_port > 65535)) ||
+          (global_port !== 0 && (global_port < 1 || global_port > 65535))) {
+        alert('端口需为 1–65535，或填 0 停用该侧');
+        return;
+      }
+      if (cn_port === 0 && global_port === 0) {
+        alert('CN 与 Global 不能同时停用：至少保留一侧端口');
+        return;
+      }
+      if (cn_port > 0 && cn_port === global_port) {
+        alert('两侧端口不能相同');
+        return;
+      }
       
       // 处理密码修改逻辑
       const oldPassword1 = ($('oldPassword1').value || '').trim();
@@ -726,7 +871,7 @@
       $('connMsg').className = 'msg';
       $('connMsg').textContent = '保存中...';
       try {
-        const body = { port, bridge_token };
+        const body = { cn_port, global_port, bridge_token };
         if (passwordData !== null) {
           // 根据类型决定使用哪个字段
           if (typeof passwordData === 'object') {

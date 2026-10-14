@@ -16,12 +16,9 @@ func NewSlotFromSecret(id, name string, region account.Region, secret string) (*
 	return NewSlot(id, name, region, b.sess, b.client), nil
 }
 
-// NewPoolBridge 用账号池创建桥接（多账号轮询 + 失败换号）。
-func NewPoolBridge(pool *Pool, templateBase map[string]interface{}) *Bridge {
-	return &Bridge{pool: pool, templateBase: templateBase}
-}
-
-// NewPoolBridgeFor 指定本桥 region，用于选号时拒绝跨区账号。
+// NewPoolBridgeFor 创建一个「区域钉死」的桥：本桥只会把请求派给同 region 的账号。
+// 双桥架构下每个端口都用自己的 region 构造，因此 CN 端口永不消耗国际号、
+// 国际端口永不消耗国内号（跨区派号曾把用户没在用的那一侧账号扣掉 549 credits）。
 func NewPoolBridgeFor(region account.Region, pool *Pool, templateBase map[string]interface{}) *Bridge {
 	return &Bridge{pool: pool, templateBase: templateBase, region: region}
 }
@@ -113,28 +110,19 @@ func (b *Bridge) slotSupportsModel(slot *Slot, model string) bool {
 	return slot.catalog[model]
 }
 
-// pickSlotForModel 按模型选号：优先选目录里有该模型的同 region 账号。
+// pickSlotForModel 按模型在本桥所属区域内选号：优先选目录里有该模型的账号。
 // 兜底同样限定同 region——跨 region 会把请求派给别区账号并扣其 credits
 // （实测 8963 曾把 CN 请求派给 global 账号产生扣费）。
+// 目录未知/拉取失败时不做过滤，避免把 auto 这类伪 key 误判成不可用。
 func (b *Bridge) pickSlotForModel(model string, exclude map[string]struct{}) (*Slot, bool) {
-	// 本桥期望的区域：Bridge.region（单账号模式天然有值）；
-	// 池模式若 region 为空则回退到池内首个 slot。
-	wantRegion := b.region
-	if wantRegion == "" && b.pool != nil {
-		b.pool.mu.Lock()
-		for _, s := range b.pool.slots {
-			wantRegion = s.Region
-			break
-		}
-		b.pool.mu.Unlock()
-	}
-	// 防御性过滤：即使池被误构建为跨区，也不选别区账号
-	// （跨区会扣到用户根本没启动的那侧账号的 credits）。
-	sameRegion := func(s *Slot) bool { return wantRegion == "" || s.Region == wantRegion }
-
 	if b.pool == nil {
 		return b.pickSlot(exclude)
 	}
+	// 本桥的区域在双桥架构下恒有值；空值只出现在单账号退化路径与测试里，
+	// 此时不做区域过滤。
+	wantRegion := b.region
+	sameRegion := func(s *Slot) bool { return wantRegion == "" || s.Region == wantRegion }
+
 	slot, ok := b.pool.Pick(exclude, func(s *Slot) bool {
 		if !sameRegion(s) {
 			return false

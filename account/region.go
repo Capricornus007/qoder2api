@@ -8,6 +8,33 @@ const (
 	RegionCN     Region = "cn"
 )
 
+// Regions 是全部受支持的区域。双桥模式下每个区域各自占一个常驻端口，
+// 顺序即「主桥 → 副桥」的展示顺序。
+var Regions = []Region{RegionCN, RegionGlobal}
+
+// 双桥默认端口：CN 与 Global 各占一个，互不抢占，可同时对外服务。
+const (
+	DefaultWebPort    = 3588
+	DefaultCNPort     = 8963
+	DefaultGlobalPort = 8964
+)
+
+// Opposite 返回另一个区域（用于「该模型在另一区」的提示）。
+func (r Region) Opposite() Region {
+	if r == RegionCN {
+		return RegionGlobal
+	}
+	return RegionCN
+}
+
+// Label 是区域的控制台展示名。
+func (r Region) Label() string {
+	if r == RegionCN {
+		return "国内版 (CN)"
+	}
+	return "国际版 (Global)"
+}
+
 // Endpoints 包含某个 region 对应的所有 API 端点
 type Endpoints struct {
 	DeviceLoginBase string // OAuth 登录页
@@ -51,6 +78,15 @@ func GetEndpoints(region Region) Endpoints {
 		return endpointsCN
 	}
 	return endpointsGlobal
+}
+
+// Normalized 把 Region 值自身归一化（空值/未知值 → global），
+// 供账号文件里 region 字段缺省的历史数据比较归属用。
+func (r Region) Normalized() Region {
+	if r == RegionCN {
+		return RegionCN
+	}
+	return RegionGlobal
 }
 
 // NormalizeRegion 将字符串归一化为合法 Region 值

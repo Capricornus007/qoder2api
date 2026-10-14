@@ -24,14 +24,25 @@ type OAuthSession struct {
 }
 
 type Status struct {
-	Running       bool   `json:"running"`
+	// Bridges 每个区域一项：双桥常驻，CN 与 Global 各自独立运行/停止。
+	Bridges []BridgeStatus `json:"bridges"`
+}
+
+// BridgeStatus 是单个区域桥的对外状态（端口、池、激活账号、未起原因）。
+type BridgeStatus struct {
+	Region        Region `json:"region"`
+	Label         string `json:"label"`
 	Port          int    `json:"port"`
+	Running       bool   `json:"running"`
+	PoolSize      int    `json:"pool_size"`
+	AccountsTotal int    `json:"accounts_total"` // 该区具备可用 secret 的账号数
 	ActiveAccount string `json:"active_account"`
-	APIMode       string `json:"api_mode"`
+	Reason        string `json:"reason,omitempty"` // 未运行时的可读原因
 }
 
 type Settings struct {
-	Port                 int                          `json:"port"`
+	CNPort               int                          `json:"cn_port"`     // CN 桥端口（默认 8963），0=不启动该侧
+	GlobalPort           int                          `json:"global_port"` // Global 桥端口（默认 8964），0=不启动该侧
 	AutoStart            bool                         `json:"auto_start"`
 	LogLevel             string                       `json:"log_level"`                    // "info" | "debug" | "error"
 	QuotaRefreshInterval int                          `json:"quota_refresh_interval"`       // 秒，0=不自动刷新

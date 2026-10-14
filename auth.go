@@ -104,16 +104,11 @@ func ensureConsolePassword() string {
 	p := hex.EncodeToString(b)
 	cur, err := account.LoadSettings()
 	if err != nil || cur == nil {
-		cur = &account.Settings{Port: 8963, LogLevel: "info"}
+		cur = &account.Settings{CNPort: account.DefaultCNPort, GlobalPort: account.DefaultGlobalPort, LogLevel: "info"}
 	}
 	cur.ConsolePassword = p
+	// 直接落盘而非走 svc.SaveSettings：启动阶段还没有桥，不需要触发端口重启
 	_ = account.SaveSettings(cur)
-	if svc != nil {
-		svc.bridgeToken = cur.BridgeToken
-		if cur.Port > 0 {
-			svc.bridgePort = cur.Port
-		}
-	}
 	logger.Info("console password auto-generated (saved to settings): %s", p)
 	logger.Info("override with env QODER2API_CONSOLE_PASSWORD or settings.console_password")
 	return p

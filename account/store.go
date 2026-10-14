@@ -53,7 +53,10 @@ func Delete(id string) error {
 	return os.Remove(filepath.Join(d, SanitizeID(id)+".json"))
 }
 
-func SetActive(id string) error {
+// SetActiveForRegion 在指定区域内设为唯一激活账号，其他区域不受影响。
+// 双桥模式下每个区域各有一个激活账号（CN 一个、Global 一个），
+// 切换某一区的激活账号绝不能把另一区的「激活」抢走——那会让另一区桥失去默认账号。
+func SetActiveForRegion(region Region, id string) error {
 	mu.Lock()
 	defer mu.Unlock()
 	d, err := dir()
@@ -64,7 +67,11 @@ func SetActive(id string) error {
 	if err != nil {
 		return err
 	}
+	want := region.Normalized()
 	for i := range accounts {
+		if accounts[i].Region.Normalized() != want {
+			continue
+		}
 		accounts[i].Active = accounts[i].ID == id
 		if err := saveUnlocked(d, &accounts[i]); err != nil {
 			return err
@@ -73,17 +80,35 @@ func SetActive(id string) error {
 	return nil
 }
 
-func GetActive() (*Account, error) {
+// GetActiveForRegion 返回该区域的激活账号；没有则返回 nil（另一区的激活账号不会被误取）。
+func GetActiveForRegion(region Region) (*Account, error) {
 	accounts, err := List()
 	if err != nil {
 		return nil, err
 	}
+	want := region.Normalized()
 	for i := range accounts {
-		if accounts[i].Active {
+		if accounts[i].Region.Normalized() == want && accounts[i].Active {
 			return &accounts[i], nil
 		}
 	}
 	return nil, nil
+}
+
+// ListByRegion 返回归属该区域的全部账号（空 region 字段视为 global）。
+func ListByRegion(region Region) ([]Account, error) {
+	accounts, err := List()
+	if err != nil {
+		return nil, err
+	}
+	want := region.Normalized()
+	out := make([]Account, 0, len(accounts))
+	for _, a := range accounts {
+		if a.Region.Normalized() == want {
+			out = append(out, a)
+		}
+	}
+	return out, nil
 }
 
 // Get 根据 ID 获取账号
@@ -183,14 +208,20 @@ func LoadSettings() (*Settings, error) {
 	if err != nil {
 		// 返回默认设置
 		return &Settings{
-			Port:      8963,
-			AutoStart: false,
-			LogLevel:  "info",
+			CNPort:     DefaultCNPort,
+			GlobalPort: DefaultGlobalPort,
+			AutoStart:  false,
+			LogLevel:   "info",
 		}, nil
 	}
 	var s Settings
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, err
+	}
+	if s.CNPort == 0 && s.GlobalPort == 0 {
+		// 两侧都为 0 会让服务没有任何 API 端口，视为未配置 → 回到默认双桥
+		s.CNPort = DefaultCNPort
+		s.GlobalPort = DefaultGlobalPort
 	}
 	return &s, nil
 }
@@ -213,7 +244,7 @@ func SaveSettings(s *Settings) error {
 func EnsureMachineSalt() (string, error) {
 	st, err := LoadSettings()
 	if err != nil || st == nil {
-		st = &Settings{Port: 8963, LogLevel: "info"}
+		st = &Settings{CNPort: DefaultCNPort, GlobalPort: DefaultGlobalPort, LogLevel: "info"}
 	}
 	if st.MachineSalt != "" {
 		return st.MachineSalt, nil

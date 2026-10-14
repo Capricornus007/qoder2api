@@ -28,20 +28,35 @@ type QoderModel struct {
 	PriceFactor     float64 `json:"price_factor,omitempty"`
 }
 
+// regionBridge 把「端口 + 账号池 + 区域」三者绑成一个常驻单元。
+// 国内版与国际版各占一个实例，互不覆盖：任何一侧启停、换号、扣完额度
+// 都不会打断另一侧正在跑的请求。
+type regionBridge struct {
+	region account.Region
+	port   int
+	server *http.Server
+	pool   *bridge.Pool
+	br     *bridge.Bridge
+	// reason 说明这一侧为什么没在监听（例如该区还没有账号）。
+	reason string
+}
+
 type Service struct {
-	bridge      *bridge.Bridge
-	pool        *bridge.Pool
-	bridgeSrv   *http.Server
-	globalSrv   *http.Server // 8964：强制 Global 账号池
-	bridgeMu    sync.Mutex
-	bridgePort  int
+	mu          sync.Mutex
+	bridges     map[account.Region]*regionBridge
+	cnPort      int
 	globalPort  int
 	bridgeToken string
 	basePrompt  []byte
 }
 
 func NewService(basePrompt []byte) *Service {
-	return &Service{bridgePort: 8963, basePrompt: basePrompt}
+	return &Service{
+		bridges:    map[account.Region]*regionBridge{},
+		cnPort:     account.DefaultCNPort,
+		globalPort: account.DefaultGlobalPort,
+		basePrompt: basePrompt,
+	}
 }
 
 func (s *Service) LoadRuntimeSettings() {
@@ -51,12 +66,34 @@ func (s *Service) LoadRuntimeSettings() {
 		return
 	}
 	logger.SetLevel(settings.LogLevel)
-	if settings.Port > 0 {
-		s.bridgePort = settings.Port
-	}
 	s.bridgeToken = settings.BridgeToken
+	s.cnPort = settings.CNPort
+	s.globalPort = settings.GlobalPort
 }
 
+// SetPorts 设置两侧的对外端口（命令行覆盖 settings）。
+func (s *Service) SetPorts(cnPort, globalPort int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cnPort = cnPort
+	s.globalPort = globalPort
+}
+
+// Ports 返回两侧当前生效的端口（0 表示该侧不监听）。
+func (s *Service) Ports() (cnPort, globalPort int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cnPort, s.globalPort
+}
+
+func (s *Service) portForLocked(r account.Region) int {
+	if r == account.RegionCN {
+		return s.cnPort
+	}
+	return s.globalPort
+}
+
+// EffectiveToken 是两个桥共用的鉴权 token。
 func (s *Service) EffectiveToken() string {
 	if s.bridgeToken != "" {
 		return s.bridgeToken
@@ -103,104 +140,364 @@ func (s *Service) AddAccountByPAT(pat, region string) (*account.Account, error) 
 	return acct, nil
 }
 
-func (s *Service) DeleteAccount(id string) error {
-	_ = account.DeleteSecret(id)
-	return account.Delete(id)
+// AfterAccountAdded 新账号落盘后调用：把它接进所属区域的桥。
+// 该侧原本没有账号时端口会自动起来；已在监听时只增量补号，不打断在途请求。
+func (s *Service) AfterAccountAdded(id string) error {
+	acct, err := account.Get(id)
+	if err != nil {
+		return err
+	}
+	return s.ensureRegionBridge(acct.Region.Normalized())
 }
 
+func (s *Service) DeleteAccount(id string) error {
+	acct, err := account.Get(id)
+	region := account.RegionGlobal
+	if err == nil {
+		region = acct.Region.Normalized()
+	}
+	_ = account.DeleteSecret(id)
+	if err := account.Delete(id); err != nil {
+		return err
+	}
+	// 只重算被删账号所在的那一侧
+	if syncErr := s.ensureRegionBridge(region); syncErr != nil {
+		logger.Info("after delete %s: region %s bridge: %v", id, region, syncErr)
+	}
+	return nil
+}
+
+// SetActiveAccount 只影响该账号所在区域的默认账号（另一区的激活状态不动）。
+// 池内已有该账号时不需要重启监听，因此切号不会掐断正在跑的流。
 func (s *Service) SetActiveAccount(id string) error {
-	if err := account.SetActive(id); err != nil {
+	acct, err := account.Get(id)
+	if err != nil {
 		return err
 	}
-	acct, err := account.GetActive()
-	if err != nil || acct == nil {
+	region := acct.Region.Normalized()
+	if err := account.SetActiveForRegion(region, id); err != nil {
 		return err
 	}
-	return s.restartBridge(acct)
+	return s.ensureRegionBridge(region)
 }
 
 func (s *Service) GetStatus() account.Status {
-	s.bridgeMu.Lock()
-	defer s.bridgeMu.Unlock()
-	running := s.bridgeSrv != nil
-	activeID := ""
-	apiMode := ""
-	if acct, _ := account.GetActive(); acct != nil {
-		activeID = acct.ID
-		apiMode = acct.APIMode
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := account.Status{}
+	for _, r := range account.Regions {
+		bs := account.BridgeStatus{
+			Region: r,
+			Label:  r.Label(),
+			Port:   s.portForLocked(r),
+		}
+		if rb := s.bridges[r]; rb != nil {
+			bs.Running = rb.server != nil
+			bs.Reason = rb.reason
+			if rb.pool != nil {
+				bs.PoolSize = rb.pool.Size()
+			}
+		}
+		if !bs.Running && bs.Reason == "" {
+			bs.Reason = "尚未启动"
+		}
+		if acct, _ := account.GetActiveForRegion(r); acct != nil {
+			bs.ActiveAccount = acct.Name
+		}
+		if accts, err := account.ListByRegion(r); err == nil {
+			usable := 0
+			for i := range accts {
+				if account.HasSecret(accts[i].ID) {
+					usable++
+				}
+			}
+			bs.AccountsTotal = usable
+		}
+		out.Bridges = append(out.Bridges, bs)
 	}
-	return account.Status{Running: running, Port: s.bridgePort, ActiveAccount: activeID, APIMode: apiMode}
+	return out
 }
 
-func (s *Service) StartBridge() error {
-	acct, err := account.GetActive()
-	if err != nil || acct == nil {
-		return fmt.Errorf("no active account")
-	}
-	return s.startBridgeWithAccount(acct)
-}
-
-// EnsureBridgeRunning 启动时调用：有激活账号且有 secret 则起桥；
-// 若激活账号无 secret，尝试第一个有 secret 的账号并激活。
-func (s *Service) EnsureBridgeRunning() error {
-	s.bridgeMu.Lock()
-	running := s.bridgeSrv != nil
-	s.bridgeMu.Unlock()
-	if running {
-		return nil
-	}
-
-	if acct, _ := account.GetActive(); acct != nil {
-		if account.HasSecret(acct.ID) {
-			return s.startBridgeWithAccount(acct)
-		}
-		logger.Error("active account %s has no secret file", acct.ID)
-	}
-
-	accounts, err := account.List()
-	if err != nil {
-		return err
-	}
-	for _, a := range accounts {
-		if !account.HasSecret(a.ID) {
-			continue
-		}
-		logger.Info("auto-activate account with secret: %s", a.Name)
-		if err := s.SetActiveAccount(a.ID); err != nil {
-			logger.Error("auto-activate failed: %v", err)
-			continue
-		}
-		return nil
-	}
-	return fmt.Errorf("no account with usable secret; please OAuth/PAT login in web console")
-}
-
-func (s *Service) StopBridge() error {
-	s.bridgeMu.Lock()
-	defer s.bridgeMu.Unlock()
+// StartAllBridges 启动阶段调用：两区各自尽力拉起。
+// 一侧缺账号绝不阻塞另一侧——这正是双版本「同时可用」的底线。
+func (s *Service) StartAllBridges() error {
 	var firstErr error
-	if s.globalSrv != nil {
-		if err := s.globalSrv.Close(); err != nil && firstErr == nil {
+	for _, r := range account.Regions {
+		if err := s.ensureRegionBridge(r); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		s.globalSrv = nil
-	}
-	if s.bridgeSrv == nil {
-		return firstErr
-	}
-	err := s.bridgeSrv.Close()
-	s.bridgeSrv = nil
-	s.bridge = nil
-	s.pool = nil
-	if err != nil {
-		return err
 	}
 	return firstErr
 }
 
-func (s *Service) restartBridge(acct *account.Account) error {
-	_ = s.StopBridge()
-	return s.startBridgeWithAccount(acct)
+// ensureRegionBridge 让该区域进入「有可用账号就在监听」的状态：
+//   - 已在监听 → 增量对齐账号池（补新号、踢已删号），不重启端口；
+//   - 未在监听 → 池里有账号就开端口，否则把原因写进状态供控制台显示。
+func (s *Service) ensureRegionBridge(region account.Region) error {
+	s.mu.Lock()
+	port := s.portForLocked(region)
+	rb := s.bridges[region]
+	if rb == nil {
+		rb = &regionBridge{region: region, port: port}
+		s.bridges[region] = rb
+	}
+	listening := rb.server != nil
+	pool := rb.pool
+	s.mu.Unlock()
+
+	if port <= 0 {
+		s.markIdle(region, 0, "该侧端口设为 0（已停用）：在控制台改端口或用 --cn-port / --global-port 指定")
+		return fmt.Errorf("%s bridge disabled by port config", region)
+	}
+	if other := s.conflictingRegion(region, port); other != "" && !listening {
+		s.markIdle(region, port, fmt.Sprintf("端口 %d 已被 %s 侧占用，请改一侧端口", port, other))
+		return fmt.Errorf("%s bridge port %d conflicts with %s", region, port, other)
+	}
+
+	if listening && pool != nil {
+		changed, err := s.syncPool(region, pool)
+		if err != nil {
+			return err
+		}
+		if changed == 0 && pool.Size() > 0 {
+			return nil
+		}
+		if pool.Size() == 0 {
+			s.stopRegion(region)
+			msg := fmt.Sprintf("region %q 没有可用账号：请在控制台以 region=%s 完成 OAuth/PAT 登录", region, region)
+			s.markIdle(region, port, msg)
+			return fmt.Errorf("no %s account with usable secret", region)
+		}
+		logger.Info("region %s pool synced: %d account(s) on port %d", region, pool.Size(), port)
+		return nil
+	}
+
+	built := s.buildRegionPool(region)
+	if built.Size() == 0 {
+		msg := fmt.Sprintf("region %q 还没有可用账号：请在控制台以 region=%s 完成 OAuth/PAT 登录", region, region)
+		s.markIdle(region, port, msg)
+		return fmt.Errorf("no %s account with usable secret", region)
+	}
+	return s.listen(region, port, built)
+}
+
+func (s *Service) conflictingRegion(region account.Region, port int) account.Region {
+	for _, r := range account.Regions {
+		if r == region {
+			continue
+		}
+		s.mu.Lock()
+		rb := s.bridges[r]
+		other := s.portForLocked(r)
+		s.mu.Unlock()
+		if other > 0 && other == port && rb != nil && rb.server != nil {
+			return r
+		}
+	}
+	return ""
+}
+
+// listen 在指定端口开启该区域的桥。二次检查 server 避免并发重复监听。
+func (s *Service) listen(region account.Region, port int, pool *bridge.Pool) error {
+	tmpl := s.renderPromptTemplate()
+	b := bridge.NewPoolBridgeFor(region, pool, tmpl)
+	srv := &http.Server{
+		Addr:    fmt.Sprintf("0.0.0.0:%d", port),
+		Handler: s.authMiddleware(region, s.bridgeMux(b)),
+	}
+
+	s.mu.Lock()
+	rb := s.bridges[region]
+	if rb == nil {
+		rb = &regionBridge{region: region}
+		s.bridges[region] = rb
+	}
+	if rb.server != nil {
+		s.mu.Unlock()
+		return nil
+	}
+	rb.server = srv
+	rb.pool = pool
+	rb.br = b
+	rb.port = port
+	rb.reason = ""
+	s.mu.Unlock()
+
+	logger.Info("Bridge started on port %d region=%s pool=%d", port, region, pool.Size())
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("bridge serve error (region=%s port=%d): %v", region, port, err)
+			s.markIdle(region, port, fmt.Sprintf("端口 %d 监听失败: %v", port, err))
+		}
+	}()
+	return nil
+}
+
+func (s *Service) bridgeMux(b *bridge.Bridge) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", b.HandleChatCompletions)
+	mux.HandleFunc("/v1/messages", b.HandleClaudeMessages)
+	mux.HandleFunc("/v1/models", b.HandleListModels)
+	mux.HandleFunc("/v1/responses", b.HandleCodexResponses)
+	return mux
+}
+
+// markIdle 记录该侧未在监听的原因（端口保留展示，方便控制台指路）。
+func (s *Service) markIdle(region account.Region, port int, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rb := s.bridges[region]
+	if rb == nil {
+		rb = &regionBridge{region: region}
+		s.bridges[region] = rb
+	}
+	rb.server = nil
+	rb.br = nil
+	rb.pool = nil
+	if port > 0 {
+		rb.port = port
+	}
+	rb.reason = reason
+}
+
+// stopRegion 关闭该侧监听；另一侧完全不受影响。
+func (s *Service) stopRegion(region account.Region) {
+	s.mu.Lock()
+	rb := s.bridges[region]
+	var srv *http.Server
+	if rb != nil {
+		srv = rb.server
+		rb.server = nil
+		rb.br = nil
+		rb.pool = nil
+	}
+	s.mu.Unlock()
+	if srv != nil {
+		_ = srv.Close()
+		logger.Info("Bridge stopped on region=%s", region)
+	}
+}
+
+// StopBridge 停止全部区域（控制台「停止」按钮）。
+func (s *Service) StopBridge() error {
+	for _, r := range account.Regions {
+		s.stopRegion(r)
+		s.markIdle(r, s.portOf(r), "已手动停止；用「启动」或新增该区域账号即可恢复")
+	}
+	return nil
+}
+
+// StopRegionBridge 只停一侧，另一侧继续服务。
+func (s *Service) StopRegionBridge(region account.Region) error {
+	s.stopRegion(region)
+	s.markIdle(region, s.portOf(region), "已手动停止；用「启动」或新增该区域账号即可恢复")
+	return nil
+}
+
+// StartBridge 启动全部区域；指定 region 时只启动那一侧。
+func (s *Service) StartBridge(region account.Region) error {
+	if region != "" {
+		return s.ensureRegionBridge(region.Normalized())
+	}
+	return s.StartAllBridges()
+}
+
+func (s *Service) portOf(region account.Region) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.portForLocked(region)
+}
+
+// syncPool 把池成员对齐到「该区域当前有 secret 的账号」，返回变动数量。
+// 新增账号是热加入（下一次选号即可能被选中），删除账号热退出，
+// 全程不重开端口，因此不会掐断该侧或其他侧的在途请求。
+func (s *Service) syncPool(region account.Region, pool *bridge.Pool) (int, error) {
+	accounts, err := account.ListByRegion(region)
+	if err != nil {
+		return 0, fmt.Errorf("list %s accounts: %w", region, err)
+	}
+	desired := map[string]string{} // id -> secret
+	names := map[string]string{}
+	for i := range accounts {
+		a := accounts[i]
+		if !account.HasSecret(a.ID) {
+			continue
+		}
+		sec, err := account.GetSecret(a.ID)
+		if err != nil {
+			logger.Error("syncPool(%s): get secret for %s: %v", region, a.Name, err)
+			continue
+		}
+		desired[a.ID] = sec
+		names[a.ID] = a.Name
+	}
+
+	changed := 0
+	for _, id := range pool.IDs() {
+		if _, keep := desired[id]; !keep {
+			pool.Remove(id)
+			changed++
+			logger.Info("syncPool(%s): removed account %s", region, id)
+		}
+	}
+	for id, sec := range desired {
+		if pool.Has(id) {
+			continue
+		}
+		slot, err := bridge.NewSlotFromSecret(id, names[id], region, sec)
+		if err != nil {
+			logger.Error("syncPool(%s): account %s unusable, skipped: %v", region, id, err)
+			continue
+		}
+		pool.Add(slot)
+		changed++
+		logger.Info("syncPool(%s): added account %s", region, id)
+	}
+	return changed, nil
+}
+
+// renderPromptTemplate 展开 baseprompt.json 里的 UUID/时间占位符。
+func (s *Service) renderPromptTemplate() map[string]interface{} {
+	tmpl := string(s.basePrompt)
+	for _, ukey := range []string{"{UUID1}", "{UUID2}", "{UUID3}", "{UUID4}", "{UUID5}"} {
+		tmpl = strings.ReplaceAll(tmpl, ukey, cosy.NewUUID())
+	}
+	tmpl = strings.ReplaceAll(tmpl, "{TIME1}", fmt.Sprintf("%d", cosy.UnixMs()))
+	var templateBase map[string]interface{}
+	_ = json.Unmarshal([]byte(tmpl), &templateBase)
+	return templateBase
+}
+
+// buildRegionPool 只把指定区域的账号建成池（另一区账号永不入池，
+// 跨区派号会扣到用户根本没在用那一侧的账号的 credits）。
+// 状态文件按区域隔离，两侧冷却记录互不覆盖。
+func (s *Service) buildRegionPool(region account.Region) *bridge.Pool {
+	pool := bridge.NewPoolWithState(filepath.Join(account.DataRoot(), "pool_state_"+string(region)+".json"))
+	accounts, err := account.ListByRegion(region)
+	if err != nil {
+		logger.Error("buildRegionPool(%s): list accounts: %v", region, err)
+		return pool
+	}
+	for i := range accounts {
+		a := accounts[i]
+		if !account.HasSecret(a.ID) {
+			continue
+		}
+		pat, err := account.GetSecret(a.ID)
+		if err != nil {
+			logger.Error("buildRegionPool(%s): get secret for %s: %v", region, a.Name, err)
+			continue
+		}
+		slot, err := bridge.NewSlotFromSecret(a.ID, a.Name, a.Region, pat)
+		if err != nil {
+			logger.Error("buildRegionPool(%s): account %s unusable, skipped: %v", region, a.Name, err)
+			continue
+		}
+		pool.Add(slot)
+		logger.Info("buildRegionPool(%s): added account %s", region, a.Name)
+	}
+	pool.LoadState()
+	return pool
 }
 
 // authMiddleware Bridge 端点（/v1/*）鉴权中间件：
@@ -209,9 +506,10 @@ func (s *Service) restartBridge(acct *account.Account) error {
 // 比较用 crypto/subtle.ConstantTimeCompare 防时序侧信道；
 // OPTIONS 预检直接放行（204），避免浏览器客户端 CORS 失败；
 // 校验失败返回 401 + OpenAI 风格错误体。
-func (s *Service) authMiddleware(next http.Handler) http.Handler {
+// region 写进日志，让「哪一侧在收请求」一眼可查。
+func (s *Service) authMiddleware(region account.Region, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		logger.Info("[HTTP] %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+		logger.Info("[HTTP][%s] %s %s from %s", region, r.Method, r.URL.Path, r.RemoteAddr)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -233,148 +531,43 @@ func (s *Service) authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Service) startBridgeWithAccount(acct *account.Account) error {
-	tmpl := string(s.basePrompt)
-	for _, ukey := range []string{"{UUID1}", "{UUID2}", "{UUID3}", "{UUID4}", "{UUID5}"} {
-		tmpl = strings.ReplaceAll(tmpl, ukey, cosy.NewUUID())
-	}
-	tmpl = strings.ReplaceAll(tmpl, "{TIME1}", fmt.Sprintf("%d", cosy.UnixMs()))
-	var templateBase map[string]interface{}
-	_ = json.Unmarshal([]byte(tmpl), &templateBase)
-
-	// 主桥账号池：只纳入与本桥区域一致的账号。
-	// 必须按 region 隔离：若把 global 账号也放进 8963 的池，模型目录命中
-	// （如 qmodel_38max / qfmodel 两区都有）会把请求派给 global 账号并扣其 credits，
-	// 而用户可能根本没启动 global 侧。请求时轮询选号，限额/限流/瞬时故障时
-	// 冷却该账号并自动换下一个（见 internal/bridge/pool.go）。
-	pool := s.buildRegionPool(acct.Region)
-	if pool.Size() == 0 {
-		return fmt.Errorf("no %s account with usable secret; please OAuth/PAT login in web console", acct.Region)
-	}
-	logger.Info("startBridgeWithAccount: region=%s pool size=%d (requested active=%s)", acct.Region, pool.Size(), acct.Name)
-
-	b := bridge.NewPoolBridgeFor(acct.Region, pool, templateBase)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", b.HandleChatCompletions)
-	mux.HandleFunc("/v1/messages", b.HandleClaudeMessages)
-	mux.HandleFunc("/v1/models", b.HandleListModels)
-	mux.HandleFunc("/v1/responses", b.HandleCodexResponses)
-
-	// mux 外包鉴权中间件：同网络客户端必须携带有效 token 才能消耗账号配额
-	handler := s.authMiddleware(mux)
-
-	s.bridgeMu.Lock()
-	s.bridge = b
-	s.pool = pool
-	s.bridgeSrv = &http.Server{
-		Addr:    fmt.Sprintf("0.0.0.0:%d", s.bridgePort),
-		Handler: handler,
-	}
-	s.bridgeMu.Unlock()
-
-	logger.Info("Bridge started on port %d", s.bridgePort)
-	go func() {
-		if err := s.bridgeSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("bridge serve error: %v", err)
+// PoolStatusByRegion 返回两侧账号池的运行时状态（未启动的一侧 slots 为空）。
+func (s *Service) PoolStatusByRegion() []map[string]interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]map[string]interface{}, 0, len(account.Regions))
+	for _, r := range account.Regions {
+		entry := map[string]interface{}{
+			"region":  r,
+			"label":   r.Label(),
+			"port":    s.portForLocked(r),
+			"running": false,
+			"slots":   []bridge.SlotStatus{},
 		}
-	}()
-
-	// 8964：Global 专用桥，强制只走 Global 账号（跨区模型不能误打到国内号）
-	if s.globalPort > 0 && s.globalPort != s.bridgePort {
-		if err := s.startGlobalBridge(templateBase); err != nil {
-			// Global 池为空不应影响主桥，仅告警
-			logger.Info("global bridge (port %d) not started: %v", s.globalPort, err)
+		if rb := s.bridges[r]; rb != nil {
+			entry["running"] = rb.server != nil
+			entry["reason"] = rb.reason
+			if rb.pool != nil {
+				entry["slots"] = rb.pool.Status()
+			}
 		}
+		out = append(out, entry)
 	}
-	return nil
-}
-
-// startGlobalBridge 启动 8964 端口的 Global 专用桥。
-// 只纳入 region=global 的账号，避免国内账号被误用于国际模型请求。
-func (s *Service) startGlobalBridge(templateBase map[string]interface{}) error {
-	pool := s.buildRegionPool(account.RegionGlobal)
-	if pool.Size() == 0 {
-		return fmt.Errorf("no global account with usable secret")
-	}
-	b := bridge.NewPoolBridgeFor(account.RegionGlobal, pool, templateBase)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", b.HandleChatCompletions)
-	mux.HandleFunc("/v1/messages", b.HandleClaudeMessages)
-	mux.HandleFunc("/v1/models", b.HandleListModels)
-	mux.HandleFunc("/v1/responses", b.HandleCodexResponses)
-
-	srv := &http.Server{
-		Addr:    fmt.Sprintf("0.0.0.0:%d", s.globalPort),
-		Handler: s.authMiddleware(mux),
-	}
-
-	s.bridgeMu.Lock()
-	s.globalSrv = srv
-	s.bridgeMu.Unlock()
-
-	logger.Info("Global bridge started on port %d (pool=%d global accounts)", s.globalPort, pool.Size())
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("global bridge serve error: %v", err)
-		}
-	}()
-	return nil
-}
-
-// buildRegionPool 只把指定区域的账号建成池（用于 8964 Global 专用桥）。
-// 状态文件按区域隔离，避免与主桥互相覆盖冷却记录。
-func (s *Service) buildRegionPool(region account.Region) *bridge.Pool {
-	pool := bridge.NewPoolWithState(filepath.Join(account.DataRoot(), "pool_state_"+string(region)+".json"))
-	accounts, err := account.List()
-	if err != nil {
-		logger.Error("buildRegionPool(%s): list accounts: %v", region, err)
-		return pool
-	}
-	for _, a := range accounts {
-		if a.Region != region {
-			continue
-		}
-		if !account.HasSecret(a.ID) {
-			continue
-		}
-		pat, err := account.GetSecret(a.ID)
-		if err != nil {
-			logger.Error("buildRegionPool(%s): get secret for %s: %v", region, a.Name, err)
-			continue
-		}
-		slot, err := bridge.NewSlotFromSecret(a.ID, a.Name, a.Region, pat)
-		if err != nil {
-			logger.Error("buildRegionPool(%s): account %s unusable, skipped: %v", region, a.Name, err)
-			continue
-		}
-		pool.Add(slot)
-		logger.Info("buildRegionPool(%s): added account %s", region, a.Name)
-	}
-	pool.LoadState()
-	return pool
-}
-
-// PoolStatus 返回账号池运行时状态（桥未启动时为空）。
-func (s *Service) PoolStatus() []bridge.SlotStatus {
-	s.bridgeMu.Lock()
-	pool := s.pool
-	s.bridgeMu.Unlock()
-	if pool == nil {
-		return nil
-	}
-	return pool.Status()
+	return out
 }
 
 // CoolAccount 手动冷却指定账号（运维/调试用，便于观察选号与换号）。
+// 账号 ID 在两池间查找，命中哪个池就冷却哪个池。
 func (s *Service) CoolAccount(id string, seconds int, reason string) error {
-	s.bridgeMu.Lock()
-	pool := s.pool
-	s.bridgeMu.Unlock()
-	if pool == nil {
-		return fmt.Errorf("bridge not running")
+	s.mu.Lock()
+	pools := make([]*bridge.Pool, 0, len(account.Regions))
+	for _, r := range account.Regions {
+		if rb := s.bridges[r]; rb != nil && rb.pool != nil {
+			pools = append(pools, rb.pool)
+		}
 	}
+	s.mu.Unlock()
+
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("id required")
 	}
@@ -384,24 +577,50 @@ func (s *Service) CoolAccount(id string, seconds int, reason string) error {
 	if strings.TrimSpace(reason) == "" {
 		reason = "manual cooldown"
 	}
-	pool.Cool(id, time.Duration(seconds)*time.Second, reason)
-	return nil
+	for _, p := range pools {
+		if p.Has(id) {
+			p.Cool(id, time.Duration(seconds)*time.Second, reason)
+			return nil
+		}
+	}
+	return fmt.Errorf("account %s not in any running pool", id)
 }
 
 func (s *Service) GetSettings() (*account.Settings, error) {
 	return account.LoadSettings()
 }
 
+// SaveSettings 落盘配置并让端口/token/日志级别即时生效：
+// 端口变化只重启受影响的那一侧，另一侧继续服务。
 func (s *Service) SaveSettings(st *account.Settings) error {
 	logger.SetLevel(st.LogLevel)
-	if st.Port > 0 {
-		s.bridgePort = st.Port
-	}
-	s.bridgeToken = st.BridgeToken
 	if st.QuotaRefreshInterval > 0 && st.QuotaRefreshInterval < 10 {
 		st.QuotaRefreshInterval = 10
 	}
-	return account.SaveSettings(st)
+	if err := account.SaveSettings(st); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	oldCN, oldGlobal := s.cnPort, s.globalPort
+	s.bridgeToken = st.BridgeToken
+	s.cnPort, s.globalPort = st.CNPort, st.GlobalPort
+	changed := []account.Region{}
+	if oldCN != st.CNPort {
+		changed = append(changed, account.RegionCN)
+	}
+	if oldGlobal != st.GlobalPort {
+		changed = append(changed, account.RegionGlobal)
+	}
+	s.mu.Unlock()
+
+	for _, r := range changed {
+		s.stopRegion(r)
+		if err := s.ensureRegionBridge(r); err != nil {
+			logger.Info("region %s restart after port change: %v", r, err)
+		}
+	}
+	return nil
 }
 
 func (s *Service) GetLogs(limit int) []logger.Entry {
@@ -437,16 +656,34 @@ func (s *Service) GetAccountQuota(accountID string) (*account.QuotaInfo, error) 
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("[SERVICE DEBUG] Quota result: user_quota=%+v, addon_quota=%+v\n", quota.UserQuota, quota.AddonQuota)
+	logger.Debug("quota result for %s: user_quota=%+v addon_quota=%+v", accountID, quota.UserQuota, quota.AddonQuota)
 	return quota, nil
 }
 
-func (s *Service) ListQoderModels() ([]QoderModel, error) {
-	s.bridgeMu.Lock()
-	b := s.bridge
-	s.bridgeMu.Unlock()
+// ListQoderModels 返回指定区域桥的模型目录；region 为空时取第一个已启动的桥。
+func (s *Service) ListQoderModels(region account.Region) ([]QoderModel, error) {
+	s.mu.Lock()
+	var b *bridge.Bridge
+	reason := ""
+	if region != "" {
+		if rb := s.bridges[region]; rb != nil {
+			b, reason = rb.br, rb.reason
+		}
+	} else {
+		for _, r := range account.Regions {
+			if rb := s.bridges[r]; rb != nil && rb.br != nil {
+				b, region = rb.br, r
+				break
+			}
+		}
+	}
+	s.mu.Unlock()
+
 	if b == nil {
-		return nil, fmt.Errorf("BRIDGE_NOT_RUNNING: bridge 未启动，请先激活账号并启动 bridge")
+		if reason == "" {
+			reason = "该侧桥未启动，请先激活账号并启动 bridge"
+		}
+		return nil, fmt.Errorf("BRIDGE_NOT_RUNNING (%s): %s", region, reason)
 	}
 	models, err := b.ListAvailableModels()
 	if err != nil {

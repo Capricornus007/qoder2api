@@ -14,7 +14,7 @@ import (
 	"qoder2api/internal/cosy"
 )
 
-func testSlot(t *testing.T, id, userType string) *Slot {
+func testSlotFull(t *testing.T, id, userType string, region account.Region) *Slot {
 	t.Helper()
 	account.SetDataRoot(t.TempDir())
 	sess, err := cosy.NewSession(
@@ -24,7 +24,15 @@ func testSlot(t *testing.T, id, userType string) *Slot {
 	if err != nil {
 		t.Fatalf("NewSession(%s): %v", id, err)
 	}
-	return NewSlot(id, id, account.RegionCN, sess, NewBearerClient(sess))
+	s := NewSlot(id, id, region, sess, NewBearerClient(sess))
+	// catalogAt 置为「刚拉过」：目录仍为 nil（不过滤），但选号路径不会去敲真实上游
+	s.catalogAt = time.Now()
+	return s
+}
+
+func testSlot(t *testing.T, id, userType string) *Slot {
+	t.Helper()
+	return testSlotFull(t, id, userType, account.RegionCN)
 }
 
 func TestPoolPickSkipsCooling(t *testing.T) {
@@ -105,7 +113,7 @@ func poolBridge(t *testing.T, url string, ids ...string) (*Bridge, *Pool) {
 		slots = append(slots, testSlot(t, id, "type_"+id))
 	}
 	pool := NewPool(slots...)
-	b := NewPoolBridge(pool, map[string]interface{}{
+	b := NewPoolBridgeFor(account.RegionCN, pool, map[string]interface{}{
 		"model_config": map[string]interface{}{"key": "auto"},
 		"messages":     []interface{}{},
 	})
@@ -231,41 +239,84 @@ func TestCooldownForRetryAfterSeconds(t *testing.T) {
 	}
 }
 
-func TestPickSlotForModelRoutesByRegion(t *testing.T) {
+// 双桥钉死区域：即使池被误装成跨区账号，CN 桥也永不派 Global 号，反之亦然。
+// （跨区派号会扣到用户根本没在跑的那一侧账号的 credits，实测扣过 549。）
+func TestPinnedBridgeNeverRoutesAcrossRegions(t *testing.T) {
 	cn := testSlot(t, "cn-slot", "t")
-	cn.catalog = map[string]bool{"gmodel": true, "qfmodel": true}
+	cn.catalog = map[string]bool{"gmodel": true}
 	cn.catalogAt = time.Now()
-	gl := testSlot(t, "global-slot", "t")
-	gl.catalog = map[string]bool{"qfmodel": true, "ultimate": true}
+	gl := testSlotFull(t, "global-slot", "t", account.RegionGlobal)
+	gl.catalog = map[string]bool{"ultimate": true}
 	gl.catalogAt = time.Now()
 
-	br := NewPoolBridge(NewPool(cn, gl), nil)
+	mixed := NewPool(cn, gl)
+	cnBridge := NewPoolBridgeFor(account.RegionCN, mixed, nil)
+	globalBridge := NewPoolBridgeFor(account.RegionGlobal, NewPool(cn, gl), nil)
 
-	// 区域独占模型 → 必须落到能提供它的区域
-	for i := 0; i < 3; i++ {
-		s, ok := br.pickSlotForModel("gmodel", nil)
-		if !ok || s.ID != "cn-slot" {
-			t.Fatalf("gmodel should route to cn-slot, got %v", s)
-		}
-		s, ok = br.pickSlotForModel("ultimate", nil)
-		if !ok || s.ID != "global-slot" {
-			t.Fatalf("ultimate should route to global-slot, got %v", s)
-		}
-	}
-
-	// 两区都有的模型 → 轮询两区
-	seen := map[string]bool{}
+	// CN 桥：连「只有 Global 有」的模型也只能落在 CN 号上
 	for i := 0; i < 4; i++ {
-		if s, ok := br.pickSlotForModel("qfmodel", nil); ok {
-			seen[s.ID] = true
+		s, ok := cnBridge.pickSlotForModel("ultimate", nil)
+		if !ok {
+			t.Fatal("cn bridge should still find a cn slot")
+		}
+		if s.Region != account.RegionCN {
+			t.Fatalf("cn bridge routed to %s (%s)", s.Region, s.ID)
 		}
 	}
-	if !seen["cn-slot"] || !seen["global-slot"] {
-		t.Fatalf("qfmodel should rotate across both regions, seen=%v", seen)
+	for i := 0; i < 4; i++ {
+		s, ok := globalBridge.pickSlotForModel("gmodel", nil)
+		if !ok {
+			t.Fatal("global bridge should still find a global slot")
+		}
+		if s.Region != account.RegionGlobal {
+			t.Fatalf("global bridge routed to %s (%s)", s.Region, s.ID)
+		}
 	}
+}
 
-	// 谁都不认识的模型 → 兜底任意可用账号
-	if s, ok := br.pickSlotForModel("nobody-has-this", nil); !ok || s == nil {
-		t.Fatalf("unknown model should fall back to any slot, got %v", s)
+// 同区域内多号时，模型目录用于优先命中真正提供该模型的账号。
+func TestPickSlotForModelUsesCatalogWithinRegion(t *testing.T) {
+	a := testSlot(t, "a", "t")
+	a.catalog = map[string]bool{"gmodel": true}
+	a.catalogAt = time.Now()
+	b := testSlot(t, "b", "t")
+	b.catalog = map[string]bool{"dmodel": true}
+	b.catalogAt = time.Now()
+	br := NewPoolBridgeFor(account.RegionCN, NewPool(a, b), nil)
+
+	if s, ok := br.pickSlotForModel("dmodel", nil); !ok || s.ID != "b" {
+		t.Fatalf("dmodel should pick b, got %v", s)
+	}
+	if s, ok := br.pickSlotForModel("gmodel", nil); !ok || s.ID != "a" {
+		t.Fatalf("gmodel should pick a, got %v", s)
+	}
+	// 目录都不认识的模型：仍在同区内兜底，不逃逸到别区
+	s, ok := br.pickSlotForModel("who-knows", nil)
+	if !ok || s.Region != account.RegionCN {
+		t.Fatalf("unknown model should fall back within region, got %v", s)
+	}
+}
+
+// 账号被删除时池要能热退出：Remove 后不再被选中，游标不越界。
+func TestPoolRemoveDropsSlot(t *testing.T) {
+	a := testSlot(t, "a", "t")
+	b := testSlot(t, "b", "t")
+	p := NewPool(a, b)
+	if !p.Has("a") || !p.Has("b") {
+		t.Fatalf("IDs=%v, want both", p.IDs())
+	}
+	if !p.Remove("a") {
+		t.Fatal("Remove(a) should report removal")
+	}
+	if p.Has("a") || p.Size() != 1 {
+		t.Fatalf("after remove: size=%d has(a)=%v", p.Size(), p.Has("a"))
+	}
+	if p.Remove("a") {
+		t.Fatal("removing an absent id should return false")
+	}
+	for i := 0; i < 3; i++ {
+		if s, ok := p.Pick(nil); !ok || s.ID != "b" {
+			t.Fatalf("pick after remove = %v (%v)", s, ok)
+		}
 	}
 }

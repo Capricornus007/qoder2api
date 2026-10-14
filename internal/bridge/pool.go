@@ -182,6 +182,59 @@ func (p *Pool) Add(s *Slot) {
 	p.slots = append(p.slots, s)
 }
 
+// Remove 从池中摘掉一个账号（账号被删除时热退出，不重启监听）。
+func (p *Pool) Remove(id string) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	found := false
+	for i, s := range p.slots {
+		if s.ID == id {
+			p.slots = append(p.slots[:i], p.slots[i+1:]...)
+			if p.cursor >= len(p.slots) {
+				p.cursor = 0
+			}
+			found = true
+			break
+		}
+	}
+	p.mu.Unlock()
+	if found {
+		p.save() // save 内部会再取 p.mu，必须在锁外调用
+	}
+	return found
+}
+
+// Has 判断账号是否在池内。
+func (p *Pool) Has(id string) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, s := range p.slots {
+		if s.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// IDs 返回池内账号 ID 快照（用于对齐池成员）。
+func (p *Pool) IDs() []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, 0, len(p.slots))
+	for _, s := range p.slots {
+		out = append(out, s.ID)
+	}
+	return out
+}
+
 func (p *Pool) Size() int {
 	if p == nil {
 		return 0

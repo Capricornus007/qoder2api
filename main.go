@@ -12,7 +12,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,48 +29,12 @@ var basePromptRaw []byte
 var svc *Service
 
 func main() {
-	webPort := flag.Int("web-port", 3588, "web console port")
-	bridgePort := flag.Int("bridge-port", 8963, "bridge api port (CN 优先，内部按模型 region 自动路由)")
-	globalPort := flag.Int("global-port", 8964, "global bridge api port (强制 Global 账号池)；0=不启动")
+	webPort := flag.Int("web-port", account.DefaultWebPort, "web console port")
+	cnPort := flag.Int("cn-port", account.DefaultCNPort, "国内版（CN）桥端口，强制只用 region=cn 账号；0=不启动该侧")
+	globalPort := flag.Int("global-port", account.DefaultGlobalPort, "国际版（Global）桥端口，强制只用 region=global 账号；0=不启动该侧")
 	bind := flag.String("bind", "0.0.0.0", "console bind address")
 	dataDir := flag.String("data-dir", "", "data root (default: $QODER2API_HOME or ~/.qoder2api)")
-	instance := flag.String("instance", "", "preset: cn (单控制台 3588 + 双桥 8963/8964) 或 global (旧版独立实例 3589/8964)")
 	flag.Parse()
-
-	// 实例预设：默认 cn = 单控制台 + 双桥（CN 8963 / Global 8964）
-	// global 预设保留给「只跑海外」的场景（独立控制台 3589 + 单桥 8964）
-	switch strings.ToLower(strings.TrimSpace(*instance)) {
-	case "cn", "china", "":
-		if !isFlagPassed("web-port") {
-			*webPort = 3588
-		}
-		if !isFlagPassed("bridge-port") {
-			*bridgePort = 8963
-		}
-		if !isFlagPassed("global-port") {
-			*globalPort = 8964
-		}
-		if *dataDir == "" && os.Getenv("QODER2API_HOME") == "" {
-			if home, err := os.UserHomeDir(); err == nil {
-				*dataDir = filepath.Join(home, ".qoder2api-cn")
-			}
-		}
-	case "global", "intl", "international":
-		if !isFlagPassed("web-port") {
-			*webPort = 3589
-		}
-		if !isFlagPassed("bridge-port") {
-			*bridgePort = 8964
-		}
-		if !isFlagPassed("global-port") {
-			*globalPort = 0 // 该模式只保留一个桥，8963 不启动
-		}
-		if *dataDir == "" && os.Getenv("QODER2API_HOME") == "" {
-			if home, err := os.UserHomeDir(); err == nil {
-				*dataDir = filepath.Join(home, ".qoder2api-global")
-			}
-		}
-	}
 
 	if *dataDir != "" {
 		account.SetDataRoot(*dataDir)
@@ -85,6 +48,13 @@ func main() {
 	svc = NewService(basePromptRaw)
 	svc.LoadRuntimeSettings()
 
+	// 命令行端口优先于 settings.json（未显式传参时沿用 settings / 默认双桥端口）
+	if isFlagPassed("cn-port") || isFlagPassed("global-port") {
+		svc.SetPorts(*cnPort, *globalPort)
+	} else {
+		*cnPort, *globalPort = svc.Ports()
+	}
+
 	// 设备指纹本机盐：首次启动自动生成并落盘（settings.json machine_salt）。
 	// 使每个部署的指纹派生空间独立，防止 uid 派生模式被上游全局识别；
 	// 生成后保持不变——变更 salt 即所有账号指纹整体漂移（等价于换设备）。
@@ -96,25 +66,18 @@ func main() {
 		logger.Error("init machine salt: %v；运行于无盐模式（hub 兼容指纹），下次启动恢复加盐将导致全部账号指纹漂移", err)
 	}
 
-	if *bridgePort > 0 {
-		svc.bridgePort = *bridgePort
-	}
-	if *globalPort > 0 {
-		svc.globalPort = *globalPort
-	}
-
-	// cookie 按控制台端口隔离，避免 3588/3589 同 host 登录互踢
+	// cookie 按控制台端口隔离，避免同机多实例登录互踢
 	consoleWebPort = *webPort
 
 	// 控制台密码：环境变量 > settings；都没有则自动生成并落盘
 	_ = ensureConsolePassword()
 
-	// 每日 10:00 自动签到调度（需在控制台手动开启，默认关闭）
+	// 每日自动签到调度（需在控制台手动开启，默认关闭）
 	StartCheckinScheduler()
 
-	// 启动时尽量自动拉起 Bridge：优先激活账号，否则尝试任意有 secret 的账号
-	if err := svc.EnsureBridgeRunning(); err != nil {
-		logger.Error("auto start bridge failed: %v", err)
+	// 启动时两侧各自尽力拉起：一侧没账号绝不阻塞另一侧
+	if err := svc.StartAllBridges(); err != nil {
+		logger.Info("至少一侧桥未启动: %v", err)
 		logger.Info("open console and login/activate an account: http://127.0.0.1:%d", *webPort)
 	}
 
@@ -160,7 +123,7 @@ func main() {
 	}
 
 	logger.Info("qoder2api console: http://%s (password protected)", addr)
-	logger.Info("bridge target port: %d (API key separate from console password)", svc.bridgePort)
+	logger.Info("dual bridge: CN=%d Global=%d (API key separate from console password)", *cnPort, *globalPort)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
@@ -204,31 +167,46 @@ func readJSON(r *http.Request, dst interface{}) error {
 	return json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(dst)
 }
 
+// connectionInfo 给出两侧桥的对外地址，供控制台一键复制。
+// 国内版走 cnPort、国际版走 globalPort，两者同时在线、互不影响。
 func connectionInfo() map[string]interface{} {
-	port := 8963
-	token := "qccg"
-	if svc != nil {
-		if svc.bridgePort > 0 {
-			port = svc.bridgePort
+	out := map[string]interface{}{}
+	if svc == nil {
+		return out
+	}
+	token := svc.EffectiveToken()
+	host := "127.0.0.1" // 控制台展示用：服务器上请改成公网/内网 IP
+	regions := map[string]interface{}{}
+	cnPort, globalPort := svc.Ports()
+	for _, r := range account.Regions {
+		port := cnPort
+		if r == account.RegionGlobal {
+			port = globalPort
 		}
-		token = svc.EffectiveToken()
+		base := fmt.Sprintf("http://%s:%d", host, port)
+		enabled := port > 0
+		item := map[string]interface{}{
+			"region":   string(r),
+			"label":    r.Label(),
+			"port":     port,
+			"enabled":  enabled,
+			"base_url": base,
+		}
+		if enabled {
+			item["openai_base_url"] = base + "/v1"
+			item["claude_base_url"] = base
+			item["newapi_hint"] = map[string]string{
+				"type":     "openai",
+				"base_url": base + "/v1",
+				"api_key":  token,
+				"model":    "auto",
+			}
+		}
+		regions[string(r)] = item
 	}
-	// 控制台展示用：服务器上请改成公网/内网 IP
-	host := "127.0.0.1"
-	base := fmt.Sprintf("http://%s:%d", host, port)
-	return map[string]interface{}{
-		"port":            port,
-		"api_key":         token,
-		"base_url":        base,
-		"openai_base_url": base + "/v1",
-		"claude_base_url": base,
-		"newapi_hint": map[string]string{
-			"type":     "openai",
-			"base_url": base + "/v1",
-			"api_key":  token,
-			"model":    "auto",
-		},
-	}
+	out["api_key"] = token
+	out["regions"] = regions
+	return out
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -403,7 +381,7 @@ func handleSetActiveAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePoolStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]interface{}{"slots": svc.PoolStatus()})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"pools": svc.PoolStatusByRegion()})
 }
 
 func handlePoolCool(w http.ResponseWriter, r *http.Request) {
@@ -437,8 +415,8 @@ func handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	if out.BridgeToken == "" {
 		out.BridgeToken = "qccg"
 	}
-	if out.Port == 0 {
-		out.Port = 8963
+	if out.CNPort == 0 && out.GlobalPort == 0 {
+		out.CNPort, out.GlobalPort = account.DefaultCNPort, account.DefaultGlobalPort
 	}
 	// 不回传明文控制台密码，只标记是否已设置
 	hasConsolePwd := strings.TrimSpace(out.ConsolePassword) != "" || strings.TrimSpace(os.Getenv("QODER2API_CONSOLE_PASSWORD")) != ""
@@ -456,7 +434,8 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Port             *int     `json:"port"`
+		CNPort           *int     `json:"cn_port"`
+		GlobalPort       *int     `json:"global_port"`
 		BridgeToken      *string  `json:"bridge_token"`
 		LogLevel         *string  `json:"log_level"`
 		AutoStart        *bool    `json:"auto_start"`
@@ -475,14 +454,31 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	cur, err := svc.GetSettings()
 	if err != nil || cur == nil {
-		cur = &account.Settings{Port: 8963, LogLevel: "info"}
+		cur = &account.Settings{CNPort: account.DefaultCNPort, GlobalPort: account.DefaultGlobalPort, LogLevel: "info"}
 	}
-	if req.Port != nil {
-		if *req.Port < 1 || *req.Port > 65535 {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid port"))
+	// 端口校验：0=停用该侧，其余必须在合法范围；两侧不能同时停用、也不能撞同一端口
+	validPort := func(p int) bool { return p >= 0 && p <= 65535 }
+	if req.CNPort != nil {
+		if !validPort(*req.CNPort) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid cn_port"))
 			return
 		}
-		cur.Port = *req.Port
+		cur.CNPort = *req.CNPort
+	}
+	if req.GlobalPort != nil {
+		if !validPort(*req.GlobalPort) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid global_port"))
+			return
+		}
+		cur.GlobalPort = *req.GlobalPort
+	}
+	if cur.CNPort == 0 && cur.GlobalPort == 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("CN 与 Global 不能同时停用：至少保留一侧端口"))
+		return
+	}
+	if cur.CNPort > 0 && cur.CNPort == cur.GlobalPort {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("两侧端口不能相同（当前 CN=%d Global=%d）", cur.CNPort, cur.GlobalPort))
+		return
 	}
 	if req.BridgeToken != nil {
 		tok := strings.TrimSpace(*req.BridgeToken)
@@ -563,12 +559,17 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		"ok":         true,
 		"connection": connectionInfo(),
 		"settings":   safe,
-		"note":       "已保存；控制台密码立即生效，Bridge 端口变更需重启 Bridge",
+		"note":       "已保存；控制台密码立即生效；端口变更只重启受影响的那一侧，另一侧不打断",
 	})
 }
 
 func handleListModels(w http.ResponseWriter, r *http.Request) {
-	models, err := svc.ListQoderModels()
+	// ?region=cn|global 指定查哪一侧；不带参数则用第一个已启动的桥
+	var region account.Region
+	if raw := strings.TrimSpace(r.URL.Query().Get("region")); raw != "" {
+		region = account.NormalizeRegion(raw)
+	}
+	models, err := svc.ListQoderModels(region)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -592,16 +593,36 @@ func handleCleanup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// requestRegion 从查询串或 JSON body 取可选的 region 参数。
+// 空串表示「两侧都作用」。
+func requestRegion(r *http.Request) account.Region {
+	if raw := strings.TrimSpace(r.URL.Query().Get("region")); raw != "" {
+		return account.NormalizeRegion(raw)
+	}
+	if r.Method == http.MethodPost {
+		var req struct {
+			Region string `json:"region"`
+		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+		if json.Unmarshal(body, &req) == nil {
+			if raw := strings.TrimSpace(req.Region); raw != "" {
+				return account.NormalizeRegion(raw)
+			}
+		}
+	}
+	return ""
+}
+
 func handleStartBridge(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
 		return
 	}
-	if err := svc.StartBridge(); err != nil {
+	if err := svc.StartBridge(requestRegion(r)); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	writeJSON(w, http.StatusOK, svc.GetStatus())
 }
 
 func handleStopBridge(w http.ResponseWriter, r *http.Request) {
@@ -609,9 +630,16 @@ func handleStopBridge(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
 		return
 	}
-	if err := svc.StopBridge(); err != nil {
+	region := requestRegion(r)
+	var err error
+	if region == "" {
+		err = svc.StopBridge()
+	} else {
+		err = svc.StopRegionBridge(region)
+	}
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	writeJSON(w, http.StatusOK, svc.GetStatus())
 }

@@ -1,0 +1,36 @@
+#!/sbin/openrc-run
+# qoder2api 双桥常驻（Artix / OpenRC，无需 systemd、无需 Docker）
+#
+# 安装：
+#   doas cp qoder2api /usr/local/bin/
+#   doas cp qoder2api.openrc /etc/init.d/qoder2api && doas chmod +x /etc/init.d/qoder2api
+#   doas install -d -m 700 /var/lib/qoder2api
+#   doas rc-update add qoder2api default && doas rc-service qoder2api start
+#
+# 可调（写进 /etc/conf.d/qoder2api）：
+#   qoder2api_args="--bind=127.0.0.1 --global-port=0"
+#   qoder2api_home="/var/lib/qoder2api"
+#   qoder2api_console_password="改我"
+
+description="qoder2api — Qoder 国内版(CN)+国际版(Global) 双桥与 Web 控制台"
+command="/usr/local/bin/qoder2api"
+command_args="${qoder2api_args:---bind=0.0.0.0}"
+command_background="yes"
+pidfile="/run/${RC_SERVICE_NAME}.pid"
+output_log="/var/log/qoder2api.out"
+error_log="/var/log/qoder2api.err"
+
+# 数据根目录：账号 JSON / secret / settings.json / 日志 / 各区冷却状态
+export QODER2API_HOME="${qoder2api_home:-/var/lib/qoder2api}"
+export QODER2API_CONSOLE_PASSWORD="${qoder2api_console_password:-}"
+
+depend() {
+	need net
+	after net
+}
+
+start_pre() {
+	checkpath -d -m 0700 "$QODER2API_HOME" || return 1
+	checkpath -f -m 0600 "$output_log" || return 1
+	checkpath -f -m 0600 "$error_log" || return 1
+}

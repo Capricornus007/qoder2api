@@ -6,8 +6,34 @@
 
 本项目基于 [wangtufly/QCCG](https://github.com/wangtufly/QCCG) **二次开发**，抽取 Bridge / 账号 / 签名核心逻辑，重做成可服务器部署的精简版本。
 
-[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.27+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/License-见原项目-blue)](https://github.com/wangtufly/QCCG/blob/main/LICENSE)
+
+---
+
+## 🔀 本 fork（Capricornus007）：国内版 + 国际版**同时可用**
+
+上游已经支持两区账号，但「同时在线」并不成立，本 fork 把它做成真正的双桥常驻。
+
+| 项目 | 上游行为 | 本 fork |
+|------|----------|---------|
+| 8963 端口归属 | 跟随**当前激活账号**的 region：激活国际号后，8963 也变成国际桥，国内号无处可走 | 8963 **永远**是国内版桥、8964 **永远**是国际版桥，各自钉死 region |
+| 切激活账号 | `restartBridge` 关掉**两台**桥再重建 → 掐断另一侧在途请求 | 只影响该区默认账号，**不重启端口**；池成员热增删 |
+| 数据目录 | `--instance=cn` / `--instance=global` 两套目录（`~/.qoder2api-cn` / `~/.qoder2api-global`），两区账号彼此看不见 | 单一 `~/.qoder2api`，两区账号同池管理，按 `region` 字段分流 |
+| 某区没账号 | 主桥照起，但区域错配 | 该区不起端口、控制台写明原因；**另一侧照常服务**；该区补上账号后端口自动上线 |
+| 端口冲突 | 未检查，两侧同值会静默只起一台 | 启动与控制台保存都会拒绝同值 / 双零 |
+| 状态与模型 | 只报一台桥、一套模型 | `/api/status`、`/api/pool`、`/api/models?region=`、连接信息全部按 CN / Global 分别给出 |
+| 部署 | 三份 systemd unit（cn / global / 混合） | 一个进程一台服务，附 **OpenRC** runscript（Artix 无 systemd） |
+
+```bash
+# 一条命令，两版同时对外
+./qoder2api --bind=127.0.0.1
+#   控制台      http://127.0.0.1:3588
+#   国内版 API  http://127.0.0.1:8963/v1   （只用 region=cn 账号）
+#   国际版 API  http://127.0.0.1:8964/v1   （只用 region=global 账号）
+```
+
+两区凭证在同一控制台里各自 OAuth/PAT 登录即可，互不覆盖激活状态（每个区域各有一个 active）。
 
 ---
 
@@ -95,6 +121,35 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 
 ## 更新记录
 
+### 🏗️ 架构（本 fork）：双桥常驻 —— 国内版与国际版**同时可用**
+
+**2026-10-14 CST** · Capricornus007 fork
+
+上游的「单控制台 + 双桥端口」还差最后一步：**8963 属于哪个区取决于当前激活账号**。
+一旦在国际号上点激活，8963 就变成国际桥，国内号没有任何端口可走；
+而每次切激活账号都会 `StopBridge()` 同时关掉两台桥再重建，另一侧的在途请求被掐断；
+`--instance=cn` / `--instance=global` 还把两区账号拆进两个数据目录，彼此看不见。
+
+本 fork 把「区域」从账号身上移到**端口**身上：
+
+| 文件 | 改动 |
+|------|------|
+| `service.go` | 引入 `regionBridge{region, port, server, pool, br, reason}`，两区各一实例；`ensureRegionBridge` 取代 `restartBridge`：已监听→`syncPool` 热增删账号，未监听→有账号才开端口；`StopRegionBridge(region)` 单侧停止；`SaveSettings` 端口变更只重启变化那侧；`GetStatus` / `PoolStatusByRegion` / `ListQoderModels(region)` 全部按区返回 |
+| `account/store.go` | `SetActive/GetActive` → `SetActiveForRegion/GetActiveForRegion`＋`ListByRegion`：每区各有一个激活账号，互不覆盖 |
+| `account/region.go` | `Regions` 列表、`Opposite()`、`Label()`、默认端口常量 |
+| `account/model.go` | `Status{Bridges []BridgeStatus}`（含 `pool_size` / `accounts_total` / `reason`）；`Settings.Port` → `CNPort` + `GlobalPort` |
+| `internal/bridge/pool.go` | 新增 `Remove/Has/IDs`，供池成员热退出 |
+| `internal/bridge/bridge_pool.go` | 删除未钉区域的 `NewPoolBridge`；`pickSlotForModel` 的区域判定不再从池内「猜」首个 slot |
+| `main.go` | `--bridge-port`/`--instance` → `--cn-port`/`--global-port`（单数据目录 `~/.qoder2api`）；端口冲突与双零校验；`/api/bridge/{start,stop}?region=`、`/api/models?region=`；`connectionInfo` 输出两区 base URL |
+| `webconsole/index.html` | 状态卡改双桥（每侧 ON/OFF、端口、可用号/池内号、激活号、单侧启停按钮与未上线原因）；接入卡加区域下拉、双端口输入、另一侧 URL 提示；模型卡按区拉取 |
+| `qoder2api.service` / `qoder2api.openrc` | 一份 systemd 单位（旧的 cn/global 两份 unit 删除）＋ OpenRC runscript，供 Artix 这类无 systemd 环境常驻 |
+
+**验证**：`account/store_test.go`（每区独立 active、空 region 归 global、端口默认值）、
+`service_dual_test.go`（无账号时的双区状态与原因、只有 CN 号时只有 8963 上线、
+停 CN 不打扰 Global 仍在服务、端口撞车被挡、删号热退出池、连接信息两区齐备）、
+`internal/bridge/pool_test.go`（钉区域的桥永不派别区号、同区内按目录选号、`Remove` 行为）。
+单测不再触碰真实上游（原先 `go test ./internal/bridge` 会打 `api2.qoder.sh`，现已隔绝）。
+
 ### 🏗️ 架构：单控制台 + 双桥端口（CN 8963 / Global 8964）
 
 **2026-10-10 21:20 CST** · [`6199925`](https://github.com/Zhengyuuuui/qoder2api/commit/6199925)
@@ -156,10 +211,13 @@ bridge  8964    region=global  仅使用 region=global 的账号
 
 ```bash
 # 查看某次请求实际用了哪个账号
-grep "using account" ~/.qoder2api-cn/logs/qccg-*.log
+grep "using account" ~/.qoder2api/logs/qccg-*.log
 
-# 排查是否有跨区误用（应只出现在 8964 侧）
-grep "using account" ~/.qoder2api-cn/logs/qccg-*.log | grep region=global
+# 跨区误用自查：8963 侧的请求只应命中 region=cn
+grep "using account" ~/.qoder2api/logs/qccg-*.log | grep 'region=global'
+
+# 某侧为什么没上线（缺账号 / 端口冲突 / 监听失败）
+curl -s -b cookies http://127.0.0.1:3588/api/status | python3 -m json.tool
 ```
 
 输出示例：
@@ -254,49 +312,39 @@ callQoder: account=yusheng zheng id=zysgm... region=global failed, failing over 
 
 ## 端口
 
-**默认（`--instance=cn`，推荐）**：单进程同时提供控制台与两个 Bridge
+**单进程双桥常驻**（默认，无需任何参数）：
 
 | 服务 | 端口 | 说明 |
 |------|------|------|
-| Web 控制台 | `3588` | **唯一控制台**，管理全部账号（CN + Global） |
-| Bridge（CN） | `8963` | 仅使用 `region=cn` 账号，按模型 region 路由 |
-| Bridge（Global） | `8964` | 仅使用 `region=global` 账号，可通过 `--global-port=0` 关闭 |
+| Web 控制台 | `3588` | 唯一控制台，管理全部账号（CN + Global） |
+| Bridge（国内版） | `8963` | **只用 `region=cn` 账号**；`--cn-port=0` 停用该侧 |
+| Bridge（国际版） | `8964` | **只用 `region=global` 账号**；`--global-port=0` 停用该侧 |
 
-数据目录：`~/.qoder2api-cn`（账号集中存放，按 `region` 字段区分归属）
+数据目录：`~/.qoder2api`（两区账号集中存放，按 `region` 字段分流；冷却状态分文件 `pool_state_cn.json` / `pool_state_global.json`）
 
-客户端接入：
+客户端接入（两个地址可同时配，互不干扰）：
 
-- CN 用户 → `http://<host>:8963/v1`
-- Global 用户 → `http://<host>:8964/v1`
+- 国内版 → `http://<host>:8963/v1`
+- 国际版 → `http://<host>:8964/v1`
 
-<details>
-<summary>兼容模式：独立 Global 实例（通常不需要）</summary>
+某一区还没有账号时，那侧端口不会监听，控制台状态里会写「region "cn" 还没有可用账号…」；
+**另一侧完全不受影响**，补上该区账号后端口自己上线（不需要重启进程）。
 
-| 实例 | Web 控制台 | Bridge API | 数据目录 |
-|------|------------|------------|----------|
-| `--instance=cn` | `3588` | `8963` + `8964` | `~/.qoder2api-cn` |
-| `--instance=global` | `3589` | `8964` | `~/.qoder2api-global` |
+两侧端口相同或同时为 0 会被拒绝（启动日志与控制台保存都会报错）——避免一侧静默失效。
 
-</details>
-
-双开请用 `--instance`：
-
-```bash
-# 国内
-./qoder2api --instance=cn
-
-# 国际
-./qoder2api --instance=global
-```
+> 只想跑单侧：`--global-port=0`（只留国内版）或 `--cn-port=0`（只留国际版）。
+> 想同一台机器再开一套独立实例：换 `--data-dir` 与三个端口即可，不再需要 `--instance`。
 
 ## 快速开始
 
 ### 1. 编译
 
+> 不需要 Docker。本项目的 Dockerfile 只是可选打包；Artix / OpenRC 等无 systemd 环境直接用下面的二进制 + runscript。
+
 ```bash
-git clone <你的仓库地址>/qoder2api.git
+git clone https://github.com/Capricornus007/qoder2api.git
 cd qoder2api
-go build -ldflags="-s -w" -o qoder2api .
+go build -ldflags="-s -w" -o qoder2api .   # Go 1.27+，纯标准库、无外部依赖
 ```
 
 Linux 交叉编译示例：
@@ -305,12 +353,14 @@ Linux 交叉编译示例：
 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o qoder2api .
 ```
 
-### 2. 启动（控制台 + 桥一体）
+### 2. 启动（控制台 + 双桥一体）
 
-一条命令同时启动 **网页控制台** 与 **Bridge 服务框架**：
+一条命令同时启动 **网页控制台** 与 **两条区域桥**：
 
 ```bash
-./qoder2api --web-port=3588 --bridge-port=8963
+./qoder2api                        # 默认 3588 控制台 + 8963 国内桥 + 8964 国际桥
+./qoder2api --cn-port=0            # 只跑国际版
+./qoder2api --global-port=0        # 只跑国内版
 ```
 
 可选参数：
@@ -318,19 +368,47 @@ GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o qoder2api .
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--web-port` | `3588` | Web 控制台端口 |
-| `--bridge-port` | `8963` | Bridge API 端口 |
-| `--bind` | `0.0.0.0` | 控制台监听地址 |
-| `--data-dir` | `~/.qoder2api` | 数据根目录（账号/密钥隔离） |
-| `--instance` | 空 | `cn`→3588 + 8963 + 8964；`global`→3589 + 8964（独立模式） |
-| `--global-port` | `8964` | Global 专用桥端口；`0` = 不启动 |
+| `--cn-port` | `8963` | 国内版桥端口（强制 `region=cn` 账号池）；`0` = 不启动该侧 |
+| `--global-port` | `8964` | 国际版桥端口（强制 `region=global` 账号池）；`0` = 不启动该侧 |
+| `--bind` | `0.0.0.0` | 控制台监听地址（桥固定监听 `0.0.0.0`，用防火墙控访问） |
+| `--data-dir` | `~/.qoder2api` | 数据根目录（两区账号 + 密钥 + 日志 + 各区冷却状态） |
 | 环境变量 `QODER2API_HOME` | — | 等同 `--data-dir` |
 | 环境变量 `QODER2API_CONSOLE_PASSWORD` | — | 控制台登录密码 |
+
+端口优先级：命令行 > `settings.json`（`cn_port` / `global_port`）> 内置默认。
+控制台里改端口会 **只重启变动的那一侧**，另一侧在途请求不断。
 
 启动成功后日志类似：
 
 ```text
-qoder2api console: http://0.0.0.0:3588
-bridge target port: 8963
+qoder2api console: http://0.0.0.0:3588 (password protected)
+dual bridge: CN=8963 Global=8964 (API key separate from console password)
+Bridge started on port 8963 region=cn pool=1
+Bridge started on port 8964 region=global pool=2
+```
+
+### 2.1 常驻运行
+
+**OpenRC（Artix 等，无需 systemd / Docker）**：
+
+```bash
+sudo cp qoder2api /usr/local/bin/
+sudo cp qoder2api.openrc /etc/init.d/qoder2api
+sudo chmod +x /etc/init.d/qoder2api
+sudo rc-update add qoder2api default
+sudo rc-service qoder2api start
+```
+runscript 里可改 `qoder2api_args` / `QODER2API_HOME`（默认 `/var/lib/qoder2api`）；
+建目录：`sudo install -d -m 700 /var/lib/qoder2api`。
+
+**systemd**：见 `qoder2api.service`（已是单进程双桥版本，旧的 cn/global 两份 unit 不再需要）。
+
+**Docker（可选）**：
+
+```bash
+docker build -t qoder2api .
+docker run -d --name qoder2api -p 3588:3588 -p 8963:8963 -p 8964:8964 \
+  -v $HOME/.qoder2api:/data qoder2api
 ```
 
 ### 3. 打开网页控制台（需登录）
@@ -349,7 +427,7 @@ http://127.0.0.1:3588
 
 ```bash
 export QODER2API_CONSOLE_PASSWORD='你的强密码'
-./qoder2api --web-port=3588 --bridge-port=8963
+./qoder2api
 ```
 
 服务器部署时替换为：
@@ -360,25 +438,32 @@ http://<服务器IP>:3588
 
 登录后在控制台中：
 
-1. 选择 Region（`global` / `cn`）
+1. 「添加账号」里选 Region（`cn` / `global`）
 2. 点击 **OAuth 登录**（或填写 PAT 添加）
-3. 授权成功后账号会写入本地，并自动 **激活**
-4. 激活后 **Bridge 自动监听 8963**
+3. 授权成功后账号写入本地，并在 **该区域** 自动激活
+4. 该区域有账号后，对应端口自动上线（CN→8963、Global→8964）；另一侧不受影响
 
-> 说明：控制台密码只保护 **管理页**；Bridge 仍用独立 API Key（默认 `qccg`），与 NewAPI 对接不受影响。  
-> CN / Global 双开时，会话 cookie 按端口隔离（`qoder2api_session_3588` / `qoder2api_session_3589`），同一浏览器可同时登录两端。
+> 说明：控制台密码只保护 **管理页**；两条桥共用独立 API Key（默认 `qccg`），与 NewAPI 对接不受影响。  
+> 每个区域各有自己的「激活账号」，切 CN 的号不会把国际号的激活状态抢走（旧版是全局单一 active）。
 
 ### 4. 启动 / 确认 Bridge
 
-- **自动**：激活账号后会自动 `startBridge`
-- **手动**：控制台可调用启动逻辑；也可用 API：
+- **自动**：启动时两区各自尽力拉起；某侧新增账号后该侧端口自动上线
+- **手动**：控制台「状态 · 双桥」有每侧的启动/停止按钮，或用 API：
 
 ```bash
-# 查看状态
-curl http://127.0.0.1:3588/api/status
+# 查看两侧状态（region / port / running / pool_size / reason）
+curl -b cookies http://127.0.0.1:3588/api/status
 
-# 确认 Bridge 模型列表（需携带 API Key，默认 qccg）
-curl -H "x-api-key: qccg" http://127.0.0.1:8963/v1/models
+# 只停国际版，国内版继续服务
+curl -b cookies -X POST 'http://127.0.0.1:3588/api/bridge/stop?region=global'
+
+# 只启动国内版
+curl -b cookies -X POST 'http://127.0.0.1:3588/api/bridge/start?region=cn'
+
+# 两区分别确认模型（需携带 API Key，默认 qccg）
+curl -s -H "x-api-key: qccg" http://127.0.0.1:8963/v1/models   # 国内版
+curl -s -H "x-api-key: qccg" http://127.0.0.1:8964/v1/models   # 国际版
 ```
 
 若返回模型 JSON，说明桥已正常；返回 401 说明 API Key 缺失或不匹配。

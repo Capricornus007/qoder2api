@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: true
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { echo "未格式化的文件："; gofmt -l .; exit 1; }
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build -ldflags="-s -w" -o qoder2api .
+
+      - name: test
+        run: go test ./...
+
+      # 双桥关键行为：无账号时两侧各自报告原因，且控制台状态同时列出 CN 与 Global
+      - name: smoke dual bridge
+        run: |
+          rm -rf /tmp/q2a && mkdir -p /tmp/q2a
+          QODER2API_CONSOLE_PASSWORD=ci ./qoder2api \
+            --bind=127.0.0.1 --web-port=13588 --cn-port=13963 --global-port=13964 \
+            --data-dir=/tmp/q2a >/tmp/q2a/stdout.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:13588/login.html && break
+            sleep 1
+          done
+          curl -sf -c /tmp/q2a/ck -X POST http://127.0.0.1:13588/api/auth/login \
+            -H 'Content-Type: application/json' -d '{"password":"ci"}' -o /dev/null
+          out=$(curl -sf -b /tmp/q2a/ck http://127.0.0.1:13588/api/status)
+          echo "$out"
+          echo "$out" | grep -q '"region":"cn"' || { echo "缺少 CN 侧状态"; exit 1; }
+          echo "$out" | grep -q '"region":"global"' || { echo "缺少 Global 侧状态"; exit 1; }
+          echo "$out" | grep -q '"reason"' || { echo "未上线的一侧没有给出原因"; exit 1; }
+          # 无账号时两个 API 端口都不该监听
+          if curl -sf -o /dev/null -m 2 http://127.0.0.1:13963/v1/models; then echo "CN 端口不该上线"; exit 1; fi
+          if curl -sf -o /dev/null -m 2 http://127.0.0.1:13964/v1/models; then echo "Global 端口不该上线"; exit 1; fi
+          # 端口撞车必须被拒绝
+          code=$(curl -s -o /dev/null -w '%{http_code}' -b /tmp/q2a/ck -X POST \
+            http://127.0.0.1:13588/api/settings/save -d '{"cn_port":13963,"global_port":13963}')
+          [ "$code" = "400" ] || { echo "同值端口未被拒绝（$code）"; exit 1; }
+
+      - name: image build
+        run: docker build -t qoder2api-ci .

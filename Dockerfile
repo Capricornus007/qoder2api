@@ -7,7 +7,9 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=build /out/qoder2api /app/qoder2api
-EXPOSE 3588 8963
+RUN mkdir -p /data && chown 10001:10001 /data
+USER 10001:10001
+EXPOSE 3588 8963 8964
 ENV HOME=/data
 VOLUME ["/data"]
 CMD ["/app/qoder2api", "--bind=0.0.0.0", "--web-port=3588", "--bridge-port=8963"]

@@ -183,6 +183,44 @@ func TestSyncPoolDropsDeletedAccounts(t *testing.T) {
 	}
 }
 
+// 两区各一把 key：留空回落默认，各自独立，改一把不影响另一把。
+func TestBridgeTokensArePerRegion(t *testing.T) {
+	account.SetDataRoot(t.TempDir())
+	s := NewService([]byte(`{"messages":[]}`))
+
+	if got := s.EffectiveToken(account.RegionCN); got != "qccg" {
+		t.Fatalf("默认 CN key = %q, want qccg", got)
+	}
+	if got := s.EffectiveToken(account.RegionGlobal); got != "qccg" {
+		t.Fatalf("默认 Global key = %q, want qccg", got)
+	}
+
+	st, err := s.GetSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.CationToken, st.GlobalToken = "key-cn", "key-gl"
+	if err := s.SaveSettings(st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if got := s.EffectiveToken(account.RegionCN); got != "key-cn" {
+		t.Fatalf("CN key = %q, want key-cn", got)
+	}
+	if got := s.EffectiveToken(account.RegionGlobal); got != "key-gl" {
+		t.Fatalf("Global key = %q, want key-gl", got)
+	}
+
+	// 重新载入（模拟进程重启）必须拿到同一对 key
+	s2 := NewService([]byte(`{"messages":[]}`))
+	s2.LoadRuntimeSettings()
+	if s2.EffectiveToken(account.RegionCN) != "key-cn" || s2.EffectiveToken(account.RegionGlobal) != "key-gl" {
+		t.Fatalf("重启后 key 漂移: cn=%q global=%q", s2.EffectiveToken(account.RegionCN), s2.EffectiveToken(account.RegionGlobal))
+	}
+	if bs := statusFor(t, s2, account.RegionCN); bs.Running {
+		t.Fatal("无账号却监听着：SaveSettings 不该把没账号的一侧起起来")
+	}
+}
+
 // 连接信息要同时给出两区 base_url，客户端才能各走各的端口。
 func TestConnectionInfoCoversBothRegions(t *testing.T) {
 	account.SetDataRoot(t.TempDir())

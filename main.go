@@ -33,6 +33,7 @@ func main() {
 	cnPort := flag.Int("cn-port", account.DefaultCNPort, "国内版（CN）桥端口，强制只用 region=cn 账号；0=不启动该侧")
 	globalPort := flag.Int("global-port", account.DefaultGlobalPort, "国际版（Global）桥端口，强制只用 region=global 账号；0=不启动该侧")
 	bind := flag.String("bind", "0.0.0.0", "console bind address")
+	bridgeBind := flag.String("bridge-bind", "0.0.0.0", "两条桥的监听地址；本机自用建议 127.0.0.1，否则同内网任何人都能用你的额度")
 	dataDir := flag.String("data-dir", "", "data root (default: $QODER2API_HOME or ~/.qoder2api)")
 	flag.Parse()
 
@@ -54,6 +55,7 @@ func main() {
 	} else {
 		*cnPort, *globalPort = svc.Ports()
 	}
+	svc.SetBridgeBind(*bridgeBind)
 
 	// 设备指纹本机盐：首次启动自动生成并落盘（settings.json machine_salt）。
 	// 使每个部署的指纹派生空间独立，防止 uid 派生模式被上游全局识别；
@@ -123,7 +125,7 @@ func main() {
 	}
 
 	logger.Info("qoder2api console: http://%s (password protected)", addr)
-	logger.Info("dual bridge: CN=%d Global=%d (API key separate from console password)", *cnPort, *globalPort)
+	logger.Info("dual bridge: CN=%d Global=%d bind=%s (API key 两区各一把，与控制台密码无关)", *cnPort, *globalPort, *bridgeBind)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
@@ -174,7 +176,6 @@ func connectionInfo() map[string]interface{} {
 	if svc == nil {
 		return out
 	}
-	token := svc.EffectiveToken()
 	host := "127.0.0.1" // 控制台展示用：服务器上请改成公网/内网 IP
 	regions := map[string]interface{}{}
 	cnPort, globalPort := svc.Ports()
@@ -183,6 +184,7 @@ func connectionInfo() map[string]interface{} {
 		if r == account.RegionGlobal {
 			port = globalPort
 		}
+		token := svc.EffectiveToken(r)
 		base := fmt.Sprintf("http://%s:%d", host, port)
 		enabled := port > 0
 		item := map[string]interface{}{
@@ -193,6 +195,7 @@ func connectionInfo() map[string]interface{} {
 			"base_url": base,
 		}
 		if enabled {
+			item["api_key"] = token
 			item["openai_base_url"] = base + "/v1"
 			item["claude_base_url"] = base
 			item["newapi_hint"] = map[string]string{
@@ -204,7 +207,6 @@ func connectionInfo() map[string]interface{} {
 		}
 		regions[string(r)] = item
 	}
-	out["api_key"] = token
 	out["regions"] = regions
 	return out
 }
@@ -412,9 +414,6 @@ func handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := *settings
-	if out.BridgeToken == "" {
-		out.BridgeToken = "qccg"
-	}
 	if out.CNPort == 0 && out.GlobalPort == 0 {
 		out.CNPort, out.GlobalPort = account.DefaultCNPort, account.DefaultGlobalPort
 	}
@@ -436,7 +435,8 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CNPort           *int     `json:"cn_port"`
 		GlobalPort       *int     `json:"global_port"`
-		BridgeToken      *string  `json:"bridge_token"`
+		CationToken      *string  `json:"cn_token"`
+		GlobalToken      *string  `json:"global_token"`
 		LogLevel         *string  `json:"log_level"`
 		AutoStart        *bool    `json:"auto_start"`
 		AutoCheckin      *bool    `json:"auto_checkin"`
@@ -480,14 +480,20 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("两侧端口不能相同（当前 CN=%d Global=%d）", cur.CNPort, cur.GlobalPort))
 		return
 	}
-	if req.BridgeToken != nil {
-		tok := strings.TrimSpace(*req.BridgeToken)
+	// 两区各一把 key；留空或填回默认值 qccg 都视为「用默认」，不落盘
+	applyToken := func(src *string, dst *string) {
+		if src == nil {
+			return
+		}
+		tok := strings.TrimSpace(*src)
 		if tok == "" || tok == "qccg" {
-			cur.BridgeToken = ""
+			*dst = ""
 		} else {
-			cur.BridgeToken = tok
+			*dst = tok
 		}
 	}
+	applyToken(req.CationToken, &cur.CationToken)
+	applyToken(req.GlobalToken, &cur.GlobalToken)
 	if req.LogLevel != nil && *req.LogLevel != "" {
 		cur.LogLevel = *req.LogLevel
 	}

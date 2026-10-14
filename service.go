@@ -46,8 +46,12 @@ type Service struct {
 	bridges     map[account.Region]*regionBridge
 	cnPort      int
 	globalPort  int
-	bridgeToken string
-	basePrompt  []byte
+	cnToken     string
+	globalToken string
+	// bridgeBind 是两条桥的监听地址。默认 0.0.0.0（沿用上游行为），
+	// 笔记本/家用机上建议 127.0.0.1：桥没有内网隔离就会把账号额度暴露在同一 LAN。
+	bridgeBind string
+	basePrompt []byte
 }
 
 func NewService(basePrompt []byte) *Service {
@@ -55,6 +59,7 @@ func NewService(basePrompt []byte) *Service {
 		bridges:    map[account.Region]*regionBridge{},
 		cnPort:     account.DefaultCNPort,
 		globalPort: account.DefaultGlobalPort,
+		bridgeBind: "0.0.0.0",
 		basePrompt: basePrompt,
 	}
 }
@@ -66,7 +71,8 @@ func (s *Service) LoadRuntimeSettings() {
 		return
 	}
 	logger.SetLevel(settings.LogLevel)
-	s.bridgeToken = settings.BridgeToken
+	s.cnToken = settings.CationToken
+	s.globalToken = settings.GlobalToken
 	s.cnPort = settings.CNPort
 	s.globalPort = settings.GlobalPort
 }
@@ -77,6 +83,25 @@ func (s *Service) SetPorts(cnPort, globalPort int) {
 	defer s.mu.Unlock()
 	s.cnPort = cnPort
 	s.globalPort = globalPort
+}
+
+// SetBridgeBind 设置两条桥的绑定地址（只影响之后启动的桥）。
+func (s *Service) SetBridgeBind(bind string) {
+	if strings.TrimSpace(bind) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bridgeBind = strings.TrimSpace(bind)
+}
+
+func (s *Service) bridgeBindAddr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(s.bridgeBind) == "" {
+		return "0.0.0.0"
+	}
+	return s.bridgeBind
 }
 
 // Ports 返回两侧当前生效的端口（0 表示该侧不监听）。
@@ -93,12 +118,20 @@ func (s *Service) portForLocked(r account.Region) int {
 	return s.globalPort
 }
 
-// EffectiveToken 是两个桥共用的鉴权 token。
-func (s *Service) EffectiveToken() string {
-	if s.bridgeToken != "" {
-		return s.bridgeToken
+// EffectiveToken 返回该区域桥的鉴权 token；留空回落到默认 "qccg"。
+// 两区各一把：额度耗尽、要撤权、给别人只放某一区时，能单独轮换那把 key，
+// 不至于因为共用一把而把另一区一起交出去。
+func (s *Service) EffectiveToken(region account.Region) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tok := s.cnToken
+	if region.Normalized() == account.RegionGlobal {
+		tok = s.globalToken
 	}
-	return "qccg"
+	if strings.TrimSpace(tok) == "" {
+		return "qccg"
+	}
+	return tok
 }
 
 func (s *Service) ListAccounts() []account.Account {
@@ -302,7 +335,7 @@ func (s *Service) listen(region account.Region, port int, pool *bridge.Pool) err
 	tmpl := s.renderPromptTemplate()
 	b := bridge.NewPoolBridgeFor(region, pool, tmpl)
 	srv := &http.Server{
-		Addr:    fmt.Sprintf("0.0.0.0:%d", port),
+		Addr:    fmt.Sprintf("%s:%d", s.bridgeBindAddr(), port),
 		Handler: s.authMiddleware(region, s.bridgeMux(b)),
 	}
 
@@ -520,7 +553,7 @@ func (s *Service) authMiddleware(region account.Region, next http.Handler) http.
 		} else if k := r.Header.Get("x-api-key"); k != "" {
 			token = k
 		}
-		expect := s.EffectiveToken()
+		expect := s.EffectiveToken(region)
 		if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(expect)) != 1 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -603,7 +636,7 @@ func (s *Service) SaveSettings(st *account.Settings) error {
 
 	s.mu.Lock()
 	oldCN, oldGlobal := s.cnPort, s.globalPort
-	s.bridgeToken = st.BridgeToken
+	s.cnToken, s.globalToken = st.CationToken, st.GlobalToken
 	s.cnPort, s.globalPort = st.CNPort, st.GlobalPort
 	changed := []account.Region{}
 	if oldCN != st.CNPort {

@@ -312,11 +312,15 @@
 
       <div style="margin-top:16px">
         <div>
-          <label>API Key / 密钥（可修改）</label>
+          <label>API Key / 密钥（只作用于上方选中的那一侧）</label>
           <div class="row">
             <input id="bridgeTokenInput" type="password" placeholder="qccg" />
             <button class="secondary" type="button" data-copy="bridgeTokenInput">复制</button>
             <button class="secondary" type="button" id="toggleBridgeToken">显示</button>
+            <button class="secondary" type="button" id="genBridgeToken">随机生成</button>
+          </div>
+          <div class="muted" style="font-size:11px; margin-top:4px">
+            CN 与 Global 各一把：撤权 / 轮换 / 只把某一区给别人时互不影响，留空即默认 <code>qccg</code>。
           </div>
         </div>
         
@@ -417,13 +421,9 @@
 
     function fillConnection(conn = {}, settings = {}) {
       lastConn = conn || {};
-      const key = conn.api_key || settings.bridge_token || 'qccg';
       const regions = conn.regions || {};
       const cn = regions.cn || {};
       const gl = regions.global || {};
-      if (document.activeElement !== $('bridgeTokenInput')) {
-        $('bridgeTokenInput').value = key;
-      }
       if (document.activeElement !== $('cnPortInput')) {
         $('cnPortInput').value = (cn.port != null ? cn.port : settings.cn_port != null ? settings.cn_port : 8963);
       }
@@ -435,12 +435,15 @@
       applyConnRegion(region);
     }
 
-    // applyConnRegion 只刷新「所选区域的地址/配置/状态」，不碰端口输入框，
+    // applyConnRegion 只刷新「所选区域的地址/密钥/配置/状态」，不碰端口输入框，
     // 避免用户正在改端口时切换区域把已输入的值冲掉。
     function applyConnRegion(region) {
       const regions = (lastConn && lastConn.regions) || {};
       const picked = regions[region] || {};
-      const key = (lastConn && lastConn.api_key) || 'qccg';
+      const key = picked.api_key || 'qccg';
+      if (document.activeElement !== $('bridgeTokenInput')) {
+        $('bridgeTokenInput').value = key;
+      }
       $('rootBaseUrl').value = picked.base_url || '-';
       $('openaiBaseUrl').value = picked.openai_base_url || '-';
       const other = region === 'cn' ? 'global' : 'cn';
@@ -724,6 +727,15 @@
 
     // 双桥控制：区域下拉、模型按区拉取、单侧启停
     $('connRegion').onchange = () => applyConnRegion($('connRegion').value);
+    $('genBridgeToken').onclick = () => {
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+      $('bridgeTokenInput').value = hex;
+      $('bridgeTokenInput').type = 'text';
+      $('connMsg').className = 'msg ok';
+      $('connMsg').textContent = `已为「${$('connRegion').value === 'cn' ? '国内版 CN' : '国际版 Global'}」生成新密钥，按保存生效`;
+    };
     $('modelsRegion').onchange = loadModels;
     $('modelsRefreshBtn').onclick = loadModels;
 
@@ -820,7 +832,10 @@
     $('saveConnBtn').onclick = async () => {
       const cn_port = Number($('cnPortInput').value || 8963);
       const global_port = Number($('globalPortInput').value || 8964);
-      const bridge_token = ($('bridgeTokenInput').value || '').trim() || 'qccg';
+      // 密钥只提交「当前选中的那一侧」，另一侧保持原值不动
+      const tokenRegion = $('connRegion') ? $('connRegion').value : 'cn';
+      const tokenField = tokenRegion === 'cn' ? 'cn_token' : 'global_token';
+      const tokenValue = ($('bridgeTokenInput').value || '').trim() || 'qccg';
       if (!Number.isFinite(cn_port) || !Number.isFinite(global_port)) {
         alert('端口必须是数字（0 = 停用该侧）');
         return;
@@ -871,7 +886,8 @@
       $('connMsg').className = 'msg';
       $('connMsg').textContent = '保存中...';
       try {
-        const body = { cn_port, global_port, bridge_token };
+        const body = { cn_port, global_port };
+        body[tokenField] = tokenValue;
         if (passwordData !== null) {
           // 根据类型决定使用哪个字段
           if (typeof passwordData === 'object') {

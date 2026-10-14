@@ -25,8 +25,10 @@ export QODER2API_HOME="${qoder2api_home:-/var/lib/qoder2api}"
 export QODER2API_CONSOLE_PASSWORD="${qoder2api_console_password:-}"
 
 depend() {
-	need net
-	after net
+	# Artix/OpenRC 没有名为 net 的服务（那是 net.lo / net-online / iwd），
+	# 用 need net 会直接起不来；这里只做可选排序。
+	use net.lo
+	after net-online
 }
 
 start_pre() {

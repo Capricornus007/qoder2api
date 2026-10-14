@@ -23,7 +23,8 @@
 | 某区没账号 | 主桥照起，但区域错配 | 该区不起端口、控制台写明原因；**另一侧照常服务**；该区补上账号后端口自动上线 |
 | 端口冲突 | 未检查，两侧同值会静默只起一台 | 启动与控制台保存都会拒绝同值 / 双零 |
 | 状态与模型 | 只报一台桥、一套模型 | `/api/status`、`/api/pool`、`/api/models?region=`、连接信息全部按 CN / Global 分别给出 |
-| 部署 | 三份 systemd unit（cn / global / 混合） | 一个进程一台服务，附 **OpenRC** runscript（Artix 无 systemd） |
+| API Key | 两桥共用一把 `bridge_token` | **两区各一把**（`cn_token` / `global_token`，留空各自回落 `qccg`）：撤权、轮换、只把某一区交给别人时互不影响 |
+| 部署 | 三份 systemd unit（cn / global / 混合） | 一个进程一台服务，附 **OpenRC** runscript（Artix 无 systemd）＋ 一条命令的登录向导脚本 |
 
 ```bash
 # 一条命令，两版同时对外
@@ -143,6 +144,9 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 | `main.go` | `--bridge-port`/`--instance` → `--cn-port`/`--global-port`（单数据目录 `~/.qoder2api`）；端口冲突与双零校验；`/api/bridge/{start,stop}?region=`、`/api/models?region=`；`connectionInfo` 输出两区 base URL |
 | `webconsole/index.html` | 状态卡改双桥（每侧 ON/OFF、端口、可用号/池内号、激活号、单侧启停按钮与未上线原因）；接入卡加区域下拉、双端口输入、另一侧 URL 提示；模型卡按区拉取 |
 | `qoder2api.service` / `qoder2api.openrc` | 一份 systemd 单位（旧的 cn/global 两份 unit 删除）＋ OpenRC runscript，供 Artix 这类无 systemd 环境常驻 |
+| `account/model.go`·`service.go`·`main.go` | API Key 拆成 `cn_token` / `global_token`（各留空回落 `qccg`），鉴权中间件按所在区域取自己那把；新增 `--bridge-bind`，两条桥不再硬绑 `0.0.0.0` |
+| `scripts/login.sh` | 一条命令走完单区 OAuth 向导（登录控制台 → 起设备流 → 打印授权链接 → 等待 → 落盘激活 → 回显状态），只发 HTTP 不碰桌面 |
+| `cmd/checkin/main.go` | 排查工具不再写死 `.qoder2api-cn` 与国内域名，改跟随默认数据目录 + 账号所在区域，空目录明确报错（原来会 index 越界 panic） |
 
 **验证**：`account/store_test.go`（每区独立 active、空 region 归 global、端口默认值）、
 `service_dual_test.go`（无账号时的双区状态与原因、只有 CN 号时只有 8963 上线、
@@ -370,7 +374,8 @@ GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o qoder2api .
 | `--web-port` | `3588` | Web 控制台端口 |
 | `--cn-port` | `8963` | 国内版桥端口（强制 `region=cn` 账号池）；`0` = 不启动该侧 |
 | `--global-port` | `8964` | 国际版桥端口（强制 `region=global` 账号池）；`0` = 不启动该侧 |
-| `--bind` | `0.0.0.0` | 控制台监听地址（桥固定监听 `0.0.0.0`，用防火墙控访问） |
+| `--bind` | `0.0.0.0` | 控制台监听地址 |
+| `--bridge-bind` | `0.0.0.0` | **两条桥的监听地址**；本机自用填 `127.0.0.1`，否则同内网任何设备带着默认 key `qccg` 就能烧你的额度 |
 | `--data-dir` | `~/.qoder2api` | 数据根目录（两区账号 + 密钥 + 日志 + 各区冷却状态） |
 | 环境变量 `QODER2API_HOME` | — | 等同 `--data-dir` |
 | 环境变量 `QODER2API_CONSOLE_PASSWORD` | — | 控制台登录密码 |
@@ -400,6 +405,19 @@ sudo rc-service qoder2api start
 ```
 runscript 里可改 `qoder2api_args` / `QODER2API_HOME`（默认 `/var/lib/qoder2api`）；
 建目录：`sudo install -d -m 700 /var/lib/qoder2api`。
+
+**一条命令登录某个区域**（`scripts/login.sh`，只发 HTTP，不碰你的桌面）：
+
+```bash
+sudo cp scripts/login.sh /usr/local/bin/qoder2api-login && sudo chmod +x /usr/local/bin/qoder2api-login
+qoder2api-login cn        # 打印国内版授权链接 → 浏览器点确认 → 自动落盘并在 CN 区激活
+qoder2api-login global    # 同上，国际版
+```
+它做的是 `/api/auth/login` → `/api/oauth/start` → `/api/oauth/wait` → 回显该区的 `/api/status`，
+所以服务必须已经在跑。控制台密码取 `QODER2API_CONSOLE_PASSWORD`，没设就交互输入（不回显）。
+
+> **两区必须轮流登**：程序里同时只保留一个待授权会话（`pending` 是单例，新流会取消旧流）。
+> 先 `qoder2api-login cn` 在浏览器点完确认、看到「已保存并激活」之后，再跑 `qoder2api-login global`。
 
 **systemd**：见 `qoder2api.service`（已是单进程双桥版本，旧的 cn/global 两份 unit 不再需要）。
 

@@ -210,7 +210,6 @@ func LoadSettings() (*Settings, error) {
 		return &Settings{
 			CNPort:     DefaultCNPort,
 			GlobalPort: DefaultGlobalPort,
-			AutoStart:  false,
 			LogLevel:   "info",
 		}, nil
 	}

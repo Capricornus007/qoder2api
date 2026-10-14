@@ -438,7 +438,6 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		CationToken      *string  `json:"cn_token"`
 		GlobalToken      *string  `json:"global_token"`
 		LogLevel         *string  `json:"log_level"`
-		AutoStart        *bool    `json:"auto_start"`
 		AutoCheckin      *bool    `json:"auto_checkin"`
 		AutoCheckinTimes []string `json:"auto_checkin_times"`
 		ConsolePassword  *string  `json:"console_password"`
@@ -496,9 +495,6 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	applyToken(req.GlobalToken, &cur.GlobalToken)
 	if req.LogLevel != nil && *req.LogLevel != "" {
 		cur.LogLevel = *req.LogLevel
-	}
-	if req.AutoStart != nil {
-		cur.AutoStart = *req.AutoStart
 	}
 	if req.AutoCheckin != nil {
 		cur.AutoCheckin = *req.AutoCheckin

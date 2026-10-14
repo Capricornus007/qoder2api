@@ -340,7 +340,8 @@ func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 			"object":            "model",
 			"created":           1687864820,
 			"owned_by":          "qoder",
-			"display_name":      m.DisplayName,
+			"name":              displayName(m),
+			"display_name":      displayName(m),
 			"context_window":    ctxWin,
 			"max_output_tokens": maxOut,
 			"enable":            m.Enable,
@@ -357,12 +358,22 @@ func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 				"object":         "model",
 				"created":        1687864820,
 				"owned_by":       "qoder",
+				"name":           key,
 				"display_name":   key,
 				"context_window": fallbackContextWindow,
 			})
 		}
 	}
 	WriteJSON(w, map[string]interface{}{"object": "list", "data": data})
+}
+
+// displayName 优先用上游回的 display_name（如 Qwen3.8-Max）；
+// 缺失时退回 key 本身——不编造名字，避免降级时给出对不上的可读名。
+func displayName(m QoderModel) string {
+	if strings.TrimSpace(m.DisplayName) != "" {
+		return m.DisplayName
+	}
+	return m.Key
 }
 
 func WriteClaudeErr(w http.ResponseWriter, err error) {

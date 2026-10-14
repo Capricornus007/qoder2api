@@ -18,6 +18,7 @@ import (
 
 type QoderModel struct {
 	Key             string  `json:"id"`
+	Name            string  `json:"name"` // 与 display_name 同值：不少客户端只认 name
 	DisplayName     string  `json:"display_name"`
 	Enable          bool    `json:"enable"`
 	IsDefault       bool    `json:"is_default"`
@@ -726,6 +727,7 @@ func (s *Service) ListQoderModels(region account.Region) ([]QoderModel, error) {
 	for i, m := range models {
 		out[i] = QoderModel{
 			Key:             m.Key,
+			Name:            m.DisplayName,
 			DisplayName:     m.DisplayName,
 			Enable:          m.Enable,
 			IsDefault:       m.IsDefault,

@@ -44,8 +44,7 @@ type Settings struct {
 	CNPort               int                          `json:"cn_port"`     // CN 桥端口（默认 8963），0=不启动该侧
 	GlobalPort           int                          `json:"global_port"` // Global 桥端口（默认 8964），0=不启动该侧
 	CationToken          string                       `json:"cn_token,omitempty"`
-	GlobalToken          string                       `json:"global_token,omitempty"` // 两区各一把 key：空则回落默认 "qccg"
-	AutoStart            bool                         `json:"auto_start"`
+	GlobalToken          string                       `json:"global_token,omitempty"`       // 两区各一把 key：空则回落默认 "qccg"
 	LogLevel             string                       `json:"log_level"`                    // "info" | "debug" | "error"
 	QuotaRefreshInterval int                          `json:"quota_refresh_interval"`       // 秒，0=不自动刷新
 	ConsolePassword      string                       `json:"console_password,omitempty"`   // Web 控制台登录密码（类似 CPA management key）

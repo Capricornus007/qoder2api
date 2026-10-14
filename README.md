@@ -145,7 +145,8 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 | `webconsole/index.html` | 状态卡改双桥（每侧 ON/OFF、端口、可用号/池内号、激活号、单侧启停按钮与未上线原因）；接入卡加区域下拉、双端口输入、另一侧 URL 提示；模型卡按区拉取 |
 | `qoder2api.service` / `qoder2api.openrc` | 一份 systemd 单位（旧的 cn/global 两份 unit 删除）＋ OpenRC runscript，供 Artix 这类无 systemd 环境常驻 |
 | `account/model.go`·`service.go`·`main.go` | API Key 拆成 `cn_token` / `global_token`（各留空回落 `qccg`），鉴权中间件按所在区域取自己那把；新增 `--bridge-bind`，两条桥不再硬绑 `0.0.0.0` |
-| `scripts/login.sh` | 一条命令走完单区 OAuth 向导（登录控制台 → 起设备流 → 打印授权链接 → 等待 → 落盘激活 → 回显状态），只发 HTTP 不碰桌面 |
+| `scripts/login.sh` | 一条命令走完 OAuth 向导（登录控制台 → 起设备流 → 打印授权链接 → 等待 → 落盘激活 → 回显状态），只发 HTTP 不碰桌面；`both` 模式一次挂两区两条流 |
+| `account/oauth.go` | 待授权会话从**单例** `pending` 改成以 loginID 为键的表：CN 与 Global 的授权流可同时挂起（原实现后起的流会 cancel 前一条，只能轮流登）；同区重跑仍只保留最新一条，过期会话启动新流时顺带清理 |
 | `cmd/checkin/main.go` | 排查工具不再写死 `.qoder2api-cn` 与国内域名，改跟随默认数据目录 + 账号所在区域，空目录明确报错（原来会 index 越界 panic） |
 
 **验证**：`account/store_test.go`（每区独立 active、空 region 归 global、端口默认值）、
@@ -406,18 +407,21 @@ sudo rc-service qoder2api start
 runscript 里可改 `qoder2api_args` / `QODER2API_HOME`（默认 `/var/lib/qoder2api`）；
 建目录：`sudo install -d -m 700 /var/lib/qoder2api`。
 
-**一条命令登录某个区域**（`scripts/login.sh`，只发 HTTP，不碰你的桌面）：
+**一条命令登录（含两区同时登）**：`scripts/login.sh`，只发 HTTP，不碰你的桌面：
 
 ```bash
 sudo cp scripts/login.sh /usr/local/bin/qoder2api-login && sudo chmod +x /usr/local/bin/qoder2api-login
-qoder2api-login cn        # 打印国内版授权链接 → 浏览器点确认 → 自动落盘并在 CN 区激活
-qoder2api-login global    # 同上，国际版
+qoder2api-login both      # 国内版 + 国际版【同时】挂两条授权流，两个链接一起给你，点完即各自激活
+qoder2api-login cn        # 只登国内版
+qoder2api-login global    # 只登国际版
 ```
-它做的是 `/api/auth/login` → `/api/oauth/start` → `/api/oauth/wait` → 回显该区的 `/api/status`，
+它做的是 `/api/auth/login` → `/api/oauth/start`（每区一条）→ 打印链接 → `/api/oauth/wait` → 回显双桥状态，
 所以服务必须已经在跑。控制台密码取 `QODER2API_CONSOLE_PASSWORD`，没设就交互输入（不回显）。
+中途 Ctrl-C 会自动 `/api/oauth/cancel`，不在服务端留僵尸会话。
 
-> **两区必须轮流登**：程序里同时只保留一个待授权会话（`pending` 是单例，新流会取消旧流）。
-> 先 `qoder2api-login cn` 在浏览器点完确认、看到「已保存并激活」之后，再跑 `qoder2api-login global`。
+> 授权会话按区域各挂一条、互不干扰（`account/oauth.go` 的 pending 以 loginID 为键）。
+> 同一区域重跑会替换掉该区上一条（避免两条同号流互抢授权），另一区不受影响。
+> 所以 `both` 模式下两个浏览器标签可以并行点，先后顺序随意。
 
 **systemd**：见 `qoder2api.service`（已是单进程双桥版本，旧的 cn/global 两份 unit 不再需要）。
 

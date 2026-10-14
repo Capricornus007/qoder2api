@@ -47,10 +47,37 @@ type pendingOAuth struct {
 	deadline time.Time
 }
 
+// pendingLogins 以 loginID 为键：国内版与国际版的授权流必须能同时挂着
+// （「双版本同时可用」包含一次命令登两个号）。旧实现是单个 pending 变量，
+// 后起的流会 cancel 掉前一条，导致只能轮流登录。
+// 同一区域仍只保留最新一条：重跑向导不该留下两条互相抢授权的同号流。
 var (
-	pendingMu sync.Mutex
-	pending   *pendingOAuth
+	pendingMu     sync.Mutex
+	pendingLogins = map[string]*pendingOAuth{}
 )
+
+// pruneExpiredLocked 清掉已过期待授权的会话（调用方须持有 pendingMu）。
+func pruneExpiredLocked() {
+	now := time.Now()
+	for id, p := range pendingLogins {
+		if now.After(p.deadline) {
+			p.cancel()
+			delete(pendingLogins, id)
+		}
+	}
+}
+
+// PendingRegions 返回当前挂着的待授权会话：region → loginID。
+// 供状态展示与测试用；同一区域最多一条。
+func PendingRegions() map[Region]string {
+	pendingMu.Lock()
+	defer pendingMu.Unlock()
+	out := map[Region]string{}
+	for _, p := range pendingLogins {
+		out[p.region.Normalized()] = p.loginID
+	}
+	return out
+}
 
 // StartLogin 启动 OAuth 登录流程
 func StartLogin(region Region) (*OAuthSession, error) {
@@ -72,11 +99,18 @@ func StartLogin(region Region) (*OAuthSession, error) {
 	logger.Info("OAuth: StartLogin loginID=%s region=%s", loginID, region)
 
 	pendingMu.Lock()
-	if pending != nil {
-		pending.cancel()
+	defer pendingMu.Unlock()
+	pruneExpiredLocked()
+	want := region.Normalized()
+	for id, p := range pendingLogins {
+		if p.region.Normalized() == want {
+			logger.Info("OAuth: replacing previous pending login for region %s (id=%s)", want, id)
+			p.cancel()
+			delete(pendingLogins, id)
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	pending = &pendingOAuth{
+	pendingLogins[loginID] = &pendingOAuth{
 		loginID:  loginID,
 		nonce:    nonce,
 		verifier: verifier,
@@ -85,37 +119,47 @@ func StartLogin(region Region) (*OAuthSession, error) {
 		cancel:   cancel,
 		deadline: time.Now().Add(oauthSessionTTL()),
 	}
-	pendingMu.Unlock()
 
 	return &OAuthSession{LoginID: loginID, LoginURL: loginURL}, nil
 }
 
-// WaitLogin 等待用户完成 OAuth 授权
+// WaitLogin 等待用户完成 OAuth 授权。只操作自己那一条会话，
+// 不影响同时在等的其他区域。
 func WaitLogin(loginID string) (*Account, error) {
 	logger.Debug("OAuth: WaitLogin called loginID=%s", loginID)
 
 	pendingMu.Lock()
-	p := pending
+	p := pendingLogins[loginID]
 	pendingMu.Unlock()
 
-	if p == nil || p.loginID != loginID {
+	if p == nil {
 		logger.Error("OAuth: no pending login for id %s", loginID)
 		return nil, fmt.Errorf("no pending login for id %s", loginID)
 	}
 
+	drop := func() {
+		pendingMu.Lock()
+		if cur, ok := pendingLogins[loginID]; ok && cur == p {
+			delete(pendingLogins, loginID)
+		}
+		pendingMu.Unlock()
+	}
+
 	ep := GetEndpoints(p.region)
 
-	logger.Info("OAuth: Starting poll loop")
+	logger.Info("OAuth: Starting poll loop (region=%s)", p.region)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		if time.Now().After(p.deadline) {
-			logger.Error("OAuth: Timeout reached")
+			logger.Error("OAuth: Timeout reached (region=%s)", p.region)
+			drop()
 			return nil, fmt.Errorf("oauth login timed out")
 		}
 		select {
 		case <-p.ctx.Done():
-			logger.Info("OAuth: Cancelled")
+			logger.Info("OAuth: Cancelled (region=%s)", p.region)
+			drop()
 			return nil, fmt.Errorf("oauth login cancelled")
 		case <-ticker.C:
 			deviceToken, refreshToken, err := pollToken(p.nonce, p.verifier, ep)
@@ -128,21 +172,20 @@ func WaitLogin(loginID string) (*Account, error) {
 				logger.Error("OAuth: Build account error: %v", err)
 				return nil, err
 			}
-			pendingMu.Lock()
-			pending = nil
-			pendingMu.Unlock()
-			logger.Info("OAuth: Success! Account: %s", acct.Name)
+			drop()
+			logger.Info("OAuth: Success! Account: %s region=%s", acct.Name, p.region)
 			return acct, nil
 		}
 	}
 }
 
+// CancelLogin 取消指定会话，其他区域的待授权流不受影响。
 func CancelLogin(loginID string) {
 	pendingMu.Lock()
 	defer pendingMu.Unlock()
-	if pending != nil && pending.loginID == loginID {
-		pending.cancel()
-		pending = nil
+	if p, ok := pendingLogins[loginID]; ok {
+		p.cancel()
+		delete(pendingLogins, loginID)
 	}
 }
 

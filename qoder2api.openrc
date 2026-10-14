@@ -2,26 +2,41 @@
 # qoder2api 双桥常驻（Artix / OpenRC，无需 systemd、无需 Docker）
 #
 # 安装：
-#   doas cp qoder2api /usr/local/bin/
-#   doas cp qoder2api.openrc /etc/init.d/qoder2api && doas chmod +x /etc/init.d/qoder2api
-#   doas install -d -m 700 /var/lib/qoder2api
-#   doas rc-update add qoder2api default && doas rc-service qoder2api start
+#   sudo cp qoder2api /usr/local/bin/
+#   sudo cp qoder2api.openrc /etc/init.d/qoder2api && sudo chmod +x /etc/init.d/qoder2api
+#   sudo install -d -m 700 -o $USER /var/lib/qoder2api     # 属主给谁，服务就以谁跑
+#   sudo rc-update add qoder2api default && sudo rc-service qoder2api start
+#   sudo cp scripts/login.sh /usr/local/bin/qoder2api-login && sudo chmod +x /usr/local/bin/qoder2api-login
 #
 # 可调（写进 /etc/conf.d/qoder2api）：
 #   qoder2api_args="--bind=127.0.0.1 --global-port=0"
 #   qoder2api_home="/var/lib/qoder2api"
-#   qoder2api_console_password="改我"
+#   qoder2api_user="avatar"      # 不填则取 qoder2api_home 的属主
 
 description="qoder2api — Qoder 国内版(CN)+国际版(Global) 双桥与 Web 控制台"
 command="/usr/local/bin/qoder2api"
-command_args="${qoder2api_args:---bind=0.0.0.0}"
 command_background="yes"
 pidfile="/run/${RC_SERVICE_NAME}.pid"
 output_log="/var/log/qoder2api.out"
 error_log="/var/log/qoder2api.err"
 
+: "${qoder2api_home:=/var/lib/qoder2api}"
+
+# 服务身份 = 数据目录属主。数据目录里是 token 与设备指纹盐，保持 0700 只给这个人读；
+# 这样 qoder2api-login 在你自己的账号下就能读到控制台密码，不用 sudo、也不用你记密码。
+# 不绑特权端口、不写系统目录，没有用 root 的理由。
+if [ -z "${qoder2api_user:-}" ]; then
+	qoder2api_user="$(stat -c '%U' "$qoder2api_home" 2>/dev/null || echo root)"
+fi
+if [ -z "${qoder2api_group:-}" ]; then
+	qoder2api_group="$(id -gn "$qoder2api_user" 2>/dev/null || echo root)"
+fi
+command_user="${qoder2api_user}:${qoder2api_group}"
+command_args="${qoder2api_args:---bind=0.0.0.0}"
+
 # 数据根目录：账号 JSON / secret / settings.json / 日志 / 各区冷却状态
-export QODER2API_HOME="${qoder2api_home:-/var/lib/qoder2api}"
+export QODER2API_HOME="$qoder2api_home"
+# 留空即让程序读 settings.json 里的 console_password（向导也是从这里取）
 export QODER2API_CONSOLE_PASSWORD="${qoder2api_console_password:-}"
 
 depend() {
@@ -32,7 +47,8 @@ depend() {
 }
 
 start_pre() {
-	checkpath -d -m 0700 "$QODER2API_HOME" || return 1
-	checkpath -f -m 0600 "$output_log" || return 1
-	checkpath -f -m 0600 "$error_log" || return 1
+	checkpath -d -m 0700 -o "${qoder2api_user}:${qoder2api_group}" "$QODER2API_HOME" || return 1
+	checkpath -d -m 0700 -o "${qoder2api_user}:${qoder2api_group}" "$QODER2API_HOME/logs" || return 1
+	checkpath -f -m 0600 -o "${qoder2api_user}:${qoder2api_group}" "$output_log" || return 1
+	checkpath -f -m 0600 -o "${qoder2api_user}:${qoder2api_group}" "$error_log" || return 1
 }

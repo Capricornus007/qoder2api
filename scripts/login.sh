@@ -34,8 +34,20 @@ body_kv() { python3 -c 'import json,sys; print(json.dumps({sys.argv[1]: sys.argv
 body_login_wait() { python3 -c 'import json,sys; print(json.dumps({"login_id": sys.argv[1], "active": True}))' "$1"; }
 
 pw="${QODER2API_CONSOLE_PASSWORD:-}"
+pw_src="环境变量 QODER2API_CONSOLE_PASSWORD"
+if [ -z "$pw" ]; then
+	# 服务与向导跑在同一个用户下：直接从 settings.json 取密码，不用 sudo 也不用手输
+	for home in "${QODER2API_HOME:-}" /var/lib/qoder2api "$HOME/.qoder2api"; do
+		[ -n "$home" ] && [ -r "$home/settings.json" ] || continue
+		got="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("console_password",""))' "$home/settings.json" 2>/dev/null)"
+		if [ -n "$got" ]; then
+			pw="$got"; pw_src="$home/settings.json"; break
+		fi
+	done
+fi
 if [ -z "$pw" ]; then
 	read -rsp "控制台密码 (${base}) : " pw; echo
+	pw_src="你刚才输入的"
 fi
 
 tmp="$(mktemp -d)"
@@ -57,7 +69,8 @@ trap cleanup EXIT
 if ! curl -sf -c "$ck" -X POST "$base/api/auth/login" \
 	-H 'Content-Type: application/json' \
 	-d "$(body_kv password "$pw")" -o /dev/null; then
-	echo "控制台登录失败：确认服务在跑（sudo rc-service qoder2api status）且密码正确" >&2
+	echo "控制台登录失败（密码来源：${pw_src}）。检查：sudo rc-service qoder2api status；" >&2
+	echo "或改密码：控制台设置里重填，或直接改 ${QODER2API_HOME:-/var/lib/qoder2api}/settings.json 的 console_password" >&2
 	exit 1
 fi
 

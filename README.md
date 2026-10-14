@@ -313,13 +313,13 @@ docker compose down
 在 GitHub 仓库打开 **Actions → Build and publish Docker image → Run workflow**，输入要发布的镜像标签并运行。工作流会构建 `linux/amd64` 和 `linux/arm64`，推送输入标签以及对应的 `sha-<commit>` 标签到：
 
 ```text
-ghcr.io/sdcom-0415/qoder2api:<tag>
+ghcr.io/<仓库所有者>/qoder2api:<tag>
 ```
 
-工作流使用仓库的 `GITHUB_TOKEN`，无需额外配置推送密钥。首次发布后，可在仓库 **Packages** 中调整镜像可见性；拉取公开镜像示例：
+镜像命名空间由工作流的 `GITHUB_REPOSITORY` 自动推导（例如本仓库发布到 `ghcr.io/zhengyuuuui/qoder2api`），fork 后无需改动即可发布到自己账号下。工作流使用仓库的 `GITHUB_TOKEN`，无需额外配置推送密钥。首次发布后，可在仓库 **Packages** 中调整镜像可见性；拉取公开镜像示例：
 
 ```bash
-docker pull ghcr.io/sdcom-0415/qoder2api:latest
+docker pull ghcr.io/zhengyuuuui/qoder2api:latest
 ```
 
 ## 快速开始

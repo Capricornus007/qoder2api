@@ -1,6 +1,7 @@
 services:
   qoder2api:
-    image: ghcr.io/sdcom-0415/qoder2api:latest
+    # 发布后可按需替换为 ghcr.io/<仓库所有者>/qoder2api:latest
+    image: qoder2api:local
     build: .
     restart: unless-stopped
     ports:

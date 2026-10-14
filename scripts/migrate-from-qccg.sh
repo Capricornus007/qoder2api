@@ -61,4 +61,4 @@ for p in accounts.glob("*.json"):
     print(f"migrated secret: {aid} ({len(plain)} bytes)")
 PY
 
-echo "done. restart: ./qoder2api --web-port=3588 --bridge-port=8963"
+echo "done. restart: ./qoder2api   # 控制台 3588 + CN 8963 + Global 8964"

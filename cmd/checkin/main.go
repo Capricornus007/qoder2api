@@ -2,7 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
+	"log"
+	"net/url"
 	"os"
 
 	"qoder2api/account"
@@ -10,9 +13,18 @@ import (
 	"qoder2api/internal/cosy"
 )
 
+// checkin 是排查签到/活动接口用的调试工具：对指定账号所在区域的活动端点逐个 GET，
+// 打印原始响应。它不参与服务运行，因此失败也不做优雅处理，只求看得清楚。
 func main() {
-	home := os.Getenv("HOME")
-	account.SetDataRoot(home + "/.qoder2api-cn")
+	dataDir := flag.String("data-dir", "", "data root (default: $QODER2API_HOME or ~/.qoder2api)")
+	accountID := flag.String("account", "", "账号 ID（默认取列表里第一个）")
+	flag.Parse()
+
+	// 单进程双桥后两区账号同在 ~/.qoder2api，按 region 分流；
+	// 这里不再写死 .qoder2api-cn，否则国际号根本读不到。
+	if *dataDir != "" {
+		account.SetDataRoot(*dataDir)
+	}
 
 	// 与主程序共享 settings.json 的指纹盐，保证同一部署内指纹一致
 	if salt, err := account.EnsureMachineSalt(); err == nil {
@@ -24,14 +36,33 @@ func main() {
 	}
 
 	accounts, _ := account.List()
+	if len(accounts) == 0 {
+		log.Fatalf("no accounts under %s (登录后再跑，或用 --data-dir 指定数据目录)", account.DataRoot())
+	}
 	acct := accounts[0]
-	token, _ := account.GetSecret(acct.ID)
+	if want := *accountID; want != "" {
+		found, err := account.Get(want)
+		if err != nil {
+			log.Fatalf("account %s: %v", want, err)
+		}
+		acct = *found
+	}
+	token, err := account.GetSecret(acct.ID)
+	if err != nil {
+		log.Fatalf("secret for %s: %v", acct.ID, err)
+	}
 	deviceToken, refreshToken := bridge.ParseOAuthSecret(token)
 	if deviceToken == "" {
 		deviceToken = token
 	}
 
-	userInfo, _ := bridge.FetchUserInfoWithToken(deviceToken, acct.Region)
+	ep := account.GetEndpoints(acct.Region.Normalized())
+	fmt.Printf("Account: %s (id=%s region=%s)\n\n", acct.Name, acct.ID, acct.Region)
+
+	userInfo, err := bridge.FetchUserInfoWithToken(deviceToken, acct.Region)
+	if err != nil {
+		log.Fatalf("userinfo: %v", err)
+	}
 	uid := bridge.ResolveOAuthUserID(userInfo)
 	name := bridge.StrVal(userInfo, "name")
 
@@ -50,28 +81,40 @@ func main() {
 		SecurityOauthToken: deviceToken,
 		RefreshToken:       refreshToken,
 	}
-	sess, _ := cosy.NewSession(identity, mid, mtoken, mtype)
+	sess, err := cosy.NewSession(identity, mid, mtoken, mtype)
+	if err != nil {
+		log.Fatalf("session: %v", err)
+	}
 	client := bridge.NewBearerClient(sess)
 
 	fmt.Printf("User: %s\n\n", name)
 
-	endpoints := []string{
-		"https://gateway.qoder.com.cn/algo/api/v2/activity",
-		"https://gateway.qoder.com.cn/algo/api/v2/activity/claim/eligibility",
-		"https://gateway.qoder.com.cn/algo/api/v2/activity/quota/reset/latest",
-		"https://openapi.qoder.com.cn/api/v2/activity",
-		"https://openapi.qoder.com.cn/api/v2/activity/claim/eligibility",
-		"https://openapi.qoder.com.cn/api/v2/user/plan",
+	// 两区主机不同（国内 gateway.qoder.com.cn / 国际 api2.qoder.sh 等），
+	// 从该区域的端点配置里取主机，不再写死国内域名。
+	hosts := []string{"https://" + ep.OpenAPIHost}
+	if u, err := url.Parse(ep.ModelListURL); err == nil {
+		hosts = append([]string{u.Scheme + "://" + u.Host}, hosts...)
+	}
+	paths := []string{
+		"/algo/api/v2/activity",
+		"/algo/api/v2/activity/claim/eligibility",
+		"/algo/api/v2/activity/quota/reset/latest",
+		"/api/v2/activity",
+		"/api/v2/activity/claim/eligibility",
+		"/api/v2/user/plan",
 	}
 
-	for _, ep := range endpoints {
-		fmt.Printf("=== GET %s ===\n", ep)
-		result, err := client.CallGetForTest(ep)
-		if err != nil {
-			fmt.Printf("  error: %v\n\n", err)
-			continue
+	for _, h := range hosts {
+		for _, p := range paths {
+			full := h + p
+			fmt.Printf("=== GET %s ===\n", full)
+			result, err := client.CallGetForTest(full)
+			if err != nil {
+				fmt.Printf("  error: %v\n\n", err)
+				continue
+			}
+			pretty, _ := json.MarshalIndent(result, "  ", "  ")
+			fmt.Printf("  %s\n\n", string(pretty))
 		}
-		pretty, _ := json.MarshalIndent(result, "  ", "  ")
-		fmt.Printf("  %s\n\n", string(pretty))
 	}
 }

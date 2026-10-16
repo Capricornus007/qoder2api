@@ -9,11 +9,21 @@ from pathlib import Path
 CAPTURE_DIR = Path(__file__).parent / "capture"
 CAPTURE_DIR.mkdir(exist_ok=True)
 
-TARGET_DOMAINS = ["qoder.com.cn", "qoder.cn", "aliyuncs.com", "aliyun.com"]
+TARGET_DOMAINS = [
+    # 国内版
+    "qoder.com.cn", "qoder.cn",
+    # 国际版（qoder.com / openapi.qoder.sh / api*.qoder.sh）
+    "qoder.sh", "qoder.com",
+    # 阿里云基础设施（活动页静态资源等）
+    "aliyuncs.com", "aliyun.com", "alicdn.com",
+]
 KEYWORDS = [
     "activity", "credit", "claim", "gift", "reward", "campaign",
     "signin", "checkin", "check-in", "daily", "bonus", "event",
     "100credits", "usage", "quota",
+    # 国际版（qoder.com）签到体系
+    "seat-activity", "credits-summary", "credits-heatmap", "limited-number",
+    "consecutive", "streak",
 ]
 
 _counter = {"n": 0}
@@ -35,7 +45,8 @@ def response(flow):
         return
 
     _counter["n"] += 1
-    key = any(k in url.lower() for k in KEYWORDS)
+    # 重点标记：命中关键词，或是非 GET（领取动作必是 POST/PUT）
+    key = any(k in url.lower() for k in KEYWORDS) or flow.request.method not in ("GET", "OPTIONS", "HEAD")
     ts = time.strftime("%Y%m%d-%H%M%S")
     prefix = "KEY" if key else "req"
     path = CAPTURE_DIR / f"{prefix}-{ts}-{_counter['n']:03d}.json"

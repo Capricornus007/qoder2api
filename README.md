@@ -58,18 +58,79 @@
 
 - **权威签到走 `campaigns`**：这是唯一真实发放积分的接口，返回 `grantId` 可核验到账
 - **不依赖 `daily-check-in`**：该 legacy 端点在国内已 `DISABLED` 且对未领取日恒返回 `409`（会误判为已领取而漏领），海外则直接 `404`
-- **⚠️ 必须携带完整设备指纹**：国际版（`qoder.com`）的签到活动**按设备指纹下发**——
-  请求若缺少 `cosy-version` / `cosy-machineid` / `cosy-machinetoken` / `cosy-machinetype` /
-  `cosy-machinecode` / `cosy-machinehostname` / `cosy-machineos` 这 7 个头，
-  服务端会**不下发 `CLAIM_BENEFIT` 签到活动**，表现为「无可用签到活动」而无法领取。
-  本项目复用 Bridge 的同一套 `cosy.FingerprintSeed` 派生规则（uid 优先、凭证兜底），
-  保证签到与推理在同一账号上表现为同一台物理设备
-- **账号准入**：服务端按账号状态灰度下发签到活动。实测新注册账号（如当天创建）
-  即使携带完整指纹也不下发活动，需账号有一定使用记录后才可见
+
+#### ⚠️ 设备指纹政策（重要）
+
+国际版（`qoder.com`）的签到活动**按真实设备身份下发**。缺指纹时服务端不下发
+`CLAIM_BEFEFIT` 活动，表现为「无可用签到活动」（`no_campaign`）。
+该结论由社区 A/B 实验验证（[issue #4](https://github.com/Zhengyuuuui/qoder2api/issues/4)，
+对照 [yetone/magpie#1268](https://github.com/yetone/magpie/issues/1268)）：
+补入 `cosy-machinetoken` + `cosy-machinetype` 后活动立即出现，移除任一字段活动消失。
+
+**自造指纹无效**：`cosy-machinetoken` 由官方客户端本地生成，客户端无法自造（实测任意自造值均被拒）。
+必须使用官方客户端的真实指纹。
+
+| 区域 | 指纹要求 |
+|------|---------|
+| `cn`（`openapi.qoder.com.cn`） | 通常**不需要** |
+| `global`（`openapi.qoder.sh`） | **首次领取前必须携带**真实指纹 |
+
+**懒下发机制**：Global 账号在官方客户端**首次领取一次后**，服务端转为「懒下发」——
+之后即使不带指纹，`campaigns` 也能查到该活动。所以新账号需先用官方客户端领一次，
+或在 qoder2api 中配置指纹。
+
+**配置方式**：在账号 JSON 中添加 `checkin_fingerprint` 字段：
+
+```json
+{
+  "id": "acct_xxx",
+  "name": "your-global-account",
+  "region": "global",
+  "checkin_fingerprint": {
+    "machine_id": "6ba86f67-4909-4a9a-9567-c289d999f0c1",
+    "machine_token": "<cosy-machinetoken>",
+    "machine_type": "<cosy-machinetype>",
+    "machine_code": "<可选，cosy-machinecode>",
+    "hostname": "localhost",
+    "machine_os": "aarch64_darwin",
+    "version": "0.4.4"
+  }
+}
+```
+
+**获取指纹**：
+
+```bash
+# 自动读取 machine_id（明文文件），并给出 token/type 的获取指引
+./scripts/extract_fingerprint.sh global
+```
+
+`machine_id` 存放在客户端明文中：
+`~/Library/Application Support/com.qoder.app.stable/auth.machine-id`（macOS）
+
+`machine_token` / `machine_type` 存于**加密**文件 `auth.v1.dat`（非标准密钥保护，无法离线解密），
+需通过抓包获取：
+
+```bash
+# 1. 启动抓包
+mitmdump -q -s scripts/capture_addon.py -p 8080
+# 2. 开启代理
+./scripts/proxy_toggle.sh on
+# 3. 打开官方客户端 →「用量面板 → 礼物图标」触发活动加载
+# 4. 关闭代理
+./scripts/proxy_toggle.sh off
+# 5. 从 scripts/capture/ 中取 URL 含 /sash/api/v1/me/campaigns 的请求头，
+#    复制 cosy-machinetoken / cosy-machinetype / cosy-version
+```
+
+#### 其他行为
+
 - **领取窗口**：`10:00 → 次日 09:59 (UTC+8)`，窗口未开启时点击会明确提示下次开放时间
 - **连续天数本地统计**：上游 legacy 统计恒为 0，故由 qoder2api 记录 `checkin_history.json` 并按**活动窗口 `startAt` 日期**（而非自然日）计算，避免 10:00 前误记
 - **调度容错**：签到时刻若活动尚未下发，不标记当日完成，每分钟重试至 12:00，避免漏签
 - **多时段支持**：`auto_checkin_times` 可配置多个 `HH:MM` 时间点（贡献者 `fcde08e`）
+- **排查辅助**：`no_campaign` 时日志会打印该账号是否带指纹、活动类型列表与原始响应，
+  便于定位是「缺指纹」还是「服务端未下发」
 
 **手动签到 API**：
 
@@ -94,6 +155,26 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 ---
 
 ## 更新记录
+
+### 📌 签到设备指纹政策（Global 需真实官方指纹）
+
+**2026-10-16 CST** · 关联 [issue #4](https://github.com/Zhengyuuuui/qoder2api/issues/4) · 对照 [yetone/magpie#1268](https://github.com/yetone/magpie/issues/1268)
+
+国际版账号签到恒为 `no_campaign` 的根因与处理方式：
+
+- **根因**：`campaigns` 接口需要**真实**的 `cosy-machinetoken` + `cosy-machinetype`
+  （官方客户端本地持有），缺失时服务端不下发 `CLAIM_BEFEFIT` 活动。
+  A/B 实验：补入后活动出现，移除任一字段活动消失
+- **自造指纹无效**：`cosy-machinetoken` 由客户端本地生成且受服务端校验，
+  任意自造值（含正确长度/格式）都会被拒 → 此前 `7702e28` 移除自造指纹方向正确但不完整
+- **指纹不是登录下发的**：实测 `deviceToken/poll`、`deviceToken/refresh` 响应中
+  均无这些字段，需从客户端本地或抓包获取
+- **懒下发**：Global 账号在官方客户端首次领取后，之后不带指纹也能查到活动——
+  解释了「同一控制台内有的 Global 号正常、有的恒 no_campaign」
+- **实现**：新增账号级 `checkin_fingerprint` 配置（`account/model.go`），
+  `checkinHeaders` 有指纹才附带、无指纹只发必要头（CN 行为）
+- **工具**：新增 `scripts/extract_fingerprint.sh`（读取明文 `machine_id` 并给出抓包指引）；
+  `no_campaign` 时日志打印指纹状态、活动类型与原始响应，便于排查
 
 ### 🏗️ 架构：单控制台 + 双桥端口（CN 8963 / Global 8964）
 

@@ -16,6 +16,24 @@ type Account struct {
 	LastUsed  *time.Time `json:"last_used,omitempty"`
 	Active    bool       `json:"active"`
 	SortOrder int        `json:"sort_order"`
+
+	// CheckinFingerprint 签到专用设备指纹（可选）。
+	// 国际版（qoder.com）的签到活动**按真实设备身份下发**：请求必须携带与登录
+	// 时协商一致的 cosy 指纹，否则服务端不下发 CLAIM_BENEFIT 活动（表现为
+	// no_campaign）。自造指纹无效，需从官方客户端抓包取得。
+	// 国内版（cn）反之——发送自造 machinetoken 会被拒，留空即可。
+	CheckinFingerprint *CheckinFingerprint `json:"checkin_fingerprint,omitempty"`
+}
+
+// CheckinFingerprint 官方客户端签到请求携带的 cosy 设备指纹。
+type CheckinFingerprint struct {
+	MachineID    string `json:"machine_id"`
+	MachineToken string `json:"machine_token"`
+	MachineType  string `json:"machine_type"`
+	MachineCode  string `json:"machine_code,omitempty"`
+	Hostname     string `json:"hostname,omitempty"`
+	MachineOS    string `json:"machine_os,omitempty"`
+	Version      string `json:"version,omitempty"`
 }
 
 type OAuthSession struct {

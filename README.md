@@ -289,6 +289,39 @@ callQoder: account=yusheng zheng id=zysgm... region=global failed, failing over 
 ./qoder2api --instance=global
 ```
 
+## Docker 部署
+
+### 本地构建运行
+
+需要安装 Docker Engine 与 Docker Compose：
+
+```bash
+docker compose up -d --build
+```
+
+控制台位于 `http://localhost:3588`，Bridge 端口为 `8963`（CN）和 `8964`（Global）。账号、密钥与设置保存在 Compose 命名卷 `qoder2api-data` 中；可通过环境变量 `QODER2API_CONSOLE_PASSWORD` 指定控制台密码，留空则首次启动时自动生成并保存。
+
+查看运行日志或停止服务：
+
+```bash
+docker compose logs -f
+docker compose down
+```
+
+### 点击按钮构建并推送到 GHCR
+
+在 GitHub 仓库打开 **Actions → Build and publish Docker image → Run workflow**，输入要发布的镜像标签并运行。工作流会构建 `linux/amd64` 和 `linux/arm64`，推送输入标签以及对应的 `sha-<commit>` 标签到：
+
+```text
+ghcr.io/<仓库所有者>/qoder2api:<tag>
+```
+
+镜像命名空间由工作流的 `GITHUB_REPOSITORY` 自动推导（例如本仓库发布到 `ghcr.io/zhengyuuuui/qoder2api`），fork 后无需改动即可发布到自己账号下。工作流使用仓库的 `GITHUB_TOKEN`，无需额外配置推送密钥。首次发布后，可在仓库 **Packages** 中调整镜像可见性；拉取公开镜像示例：
+
+```bash
+docker pull ghcr.io/zhengyuuuui/qoder2api:latest
+```
+
 ## 快速开始
 
 ### 1. 编译

@@ -25,6 +25,12 @@
 
 感谢 [@LeonardW-sl](https://github.com/LeonardW-sl) 的持续贡献与代码质量（含单元测试覆盖）。欢迎更多社区朋友参与共建。
 
+### 其他贡献者
+
+| 贡献者 | 贡献 | 说明 |
+|------|-----|------|
+| [@SDCOM-0415](https://github.com/SDCOM-0415) | **定位 `--instance=global` 端口被覆盖 Bug** | 发现 `ensureConsolePassword()` 首次启动写盘默认 `port:8963` 覆盖 `--instance=global` 预设的 `8964`，并给出修复方向（见[更新记录](#-修复-instanceglobal-的-bridge-端口被-settings-默认值冲成-8963)） |
+
 ---
 
 ## ✨ 新功能：每日签到领 100 Credits
@@ -155,6 +161,45 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 ---
 
 ## 更新记录
+
+### 🐛 修复：`--instance=global` 的 Bridge 端口被 settings 默认值冲成 8963
+
+**2026-10-16 14:25 CST** · 由社区贡献者 [@SDCOM-0415](https://github.com/SDCOM-0415) 定位
+
+**问题现象**
+
+按 README 使用 `./qoder2api --instance global` 启动，文档承诺 Bridge 端口为 `8964`，
+实际却监听 `8963`；`ss -tlnp | grep 8964` 无结果，按 8964 接入的客户端全部连不上。
+
+**根因**
+
+`ensureConsolePassword()` 在**首次启动**时会 `LoadSettings()`（无 `settings.json` 时返回默认
+`Port=8963`），把 `{port:8963, console_password:...}` **写盘**，并同步
+`svc.bridgePort = cur.Port`。这一步发生在 `--instance` 预设端口应用**之后**，
+于是 `--instance=global` 预设的 `8964` 被静默覆盖回 `8963`，且无任何端口相关日志。
+
+> 注：并非 `LoadRuntimeSettings()` 的问题——`main.go` 在其后已用 `*bridgePort` 修正过，
+> 真正冲掉的是随后执行的 `ensureConsolePassword()`。
+
+**修复**
+
+- `auth.go`：`ensureConsolePassword()` 只同步 `BridgeToken`，**不再覆盖** `svc.bridgePort`
+- `main.go`：把端口最终裁决移到 `ensureConsolePassword()` **之后**，并明确优先级：
+  `显式 --instance 预设 > 显式端口 flag > settings.json > 内置默认`
+
+**验证（全新数据目录）**
+
+| 启动参数 | 修复前 | 修复后 | 说明 |
+|---|---|---|---|
+| `--instance=global` | ❌ `8963` | ✅ `8964` | 本 Bug 主场景 |
+| `--instance=cn` | `8963` | ✅ `8963` | 回归 |
+| `--bridge-port=9999` | `9999` | ✅ `9999` | 显式 flag 优先（`9999` 仅为测试用任意端口） |
+| 无端口参数（默认 cn） | `8963` | ✅ `8963` | 回归 |
+
+> 表中 `9999` 是验证"显式 `--bridge-port` 是否优先生效"所用的**任意空闲测试端口**，
+> 并非项目默认或推荐端口。生产请使用默认 `8963`（CN）/ `8964`（Global）。
+
+---
 
 ### 📌 签到设备指纹政策（Global 需真实官方指纹）
 

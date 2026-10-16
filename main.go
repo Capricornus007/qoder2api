@@ -38,6 +38,9 @@ func main() {
 	instance := flag.String("instance", "", "preset: cn (单控制台 3588 + 双桥 8963/8964) 或 global (旧版独立实例 3589/8964)")
 	flag.Parse()
 
+	// 是否显式指定了 --instance（用于后续端口优先级判断）
+	isInstanceSet := strings.TrimSpace(*instance) != ""
+
 	// 实例预设：默认 cn = 单控制台 + 双桥（CN 8963 / Global 8964）
 	// global 预设保留给「只跑海外」的场景（独立控制台 3589 + 单桥 8964）
 	switch strings.ToLower(strings.TrimSpace(*instance)) {
@@ -96,18 +99,33 @@ func main() {
 		logger.Error("init machine salt: %v；运行于无盐模式（hub 兼容指纹），下次启动恢复加盐将导致全部账号指纹漂移", err)
 	}
 
-	if *bridgePort > 0 {
-		svc.bridgePort = *bridgePort
-	}
-	if *globalPort > 0 {
-		svc.globalPort = *globalPort
-	}
-
 	// cookie 按控制台端口隔离，避免 3588/3589 同 host 登录互踢
 	consoleWebPort = *webPort
 
 	// 控制台密码：环境变量 > settings；都没有则自动生成并落盘
 	_ = ensureConsolePassword()
+
+	// ★ 端口最终裁决（必须在 ensureConsolePassword 之后）：
+	//   ensureConsolePassword 首次启动会 LoadSettings()（无文件时返回默认 Port=8963）
+	//   并写回 settings.json，若不在此处重新覆盖，--instance=global 预设的 8964 会被冲掉。
+	//
+	//   优先级：显式 --instance 预设 > 显式端口 flag > settings.json > 内置默认。
+	if isInstanceSet {
+		// --instance 预设是权威值，直接采用（已含 cn/global 的完整端口组合）
+		svc.bridgePort = *bridgePort
+		svc.globalPort = *globalPort
+	} else {
+		// 未指定 --instance：显式 flag 优先，否则沿用 settings.json 加载到的值
+		if isFlagPassed("bridge-port") {
+			svc.bridgePort = *bridgePort
+		}
+		if isFlagPassed("global-port") {
+			svc.globalPort = *globalPort
+		} else if svc.globalPort == 0 && svc.bridgePort != 0 {
+			// settings 未提供 global 端口时，按 cn 默认启用 8964 双桥
+			svc.globalPort = 8964
+		}
+	}
 
 	// 每日 10:00 自动签到调度（需在控制台手动开启，默认关闭）
 	StartCheckinScheduler()

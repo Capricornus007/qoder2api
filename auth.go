@@ -108,11 +108,11 @@ func ensureConsolePassword() string {
 	}
 	cur.ConsolePassword = p
 	_ = account.SaveSettings(cur)
+	// 注意：这里只同步 BridgeToken，不覆盖 svc.bridgePort。
+	// 端口优先级由 main 的 --instance/--bridge-port 决定，避免首次启动时
+	// settings 默认值（8963）把 --instance=global 预设的 8964 冲掉。
 	if svc != nil {
 		svc.bridgeToken = cur.BridgeToken
-		if cur.Port > 0 {
-			svc.bridgePort = cur.Port
-		}
 	}
 	logger.Info("console password auto-generated (saved to settings): %s", p)
 	logger.Info("override with env QODER2API_CONSOLE_PASSWORD or settings.console_password")

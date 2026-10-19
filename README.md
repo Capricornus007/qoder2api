@@ -162,6 +162,29 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 
 ## 更新记录
 
+### 🔄 上游模型清单更新
+
+**2026-10-20 CST** · 模型列表为运行时动态拉取（`/algo/api/v2/model/list`），无需改代码；以下仅作变更留档。
+
+**国内版（14 个）**
+
+| Key | 显示名 | 变化 |
+|-----|--------|------|
+| `mmodel` | **MiniMax-M3.1-Flash** | 🔄 更名（原 MiniMax-M2.7） |
+| `qmodel_38max` | Qwen3.8-Max | 💰 price 0.5 → **0.2**（降价） |
+| `dmodel` | DeepSeek-V4-Pro | 💰 price 0.8 → **0.5**（降价） |
+| `gmodel` | GLM-5.3 | 💰 price 0.6 → **0.8**（涨价） |
+| `kmodel` | Kimi-K2.8-Preview | 💰 price 0.3 → **0.8**（涨价） |
+| `kmodel_latest` | Kimi-K3 | 💰 price 0.8 → **1.4**（涨价） |
+| `dfmodel` | DeepSeek-Flash | 🆓 price=**0**（免费） |
+| `qfmodel` | Qwen3.8-Flash | 🆓 price=**0**（限免活动延续） |
+
+**国际版（15 个）**：比国内多 `ultimate` / `performance`（ctx **272K**，最大）/ `efficient` 三个独占档位；
+国内独有 `q37fmodel`（Qwen3.7-Flash）与 `gm51model`（GLM-5.2）。
+
+> ⚠️ `mmodel` 只是**显示名**变化，key 未变，已有调用与映射无需调整。
+> 若在控制台手工配过 `ModelMappings` 且使用了旧显示名，请改为 key。
+
 ### 🐛 修复：`--instance=global` 的 Bridge 端口被 settings 默认值冲成 8963
 
 **2026-10-16 14:25 CST** · 由社区贡献者 [@SDCOM-0415](https://github.com/SDCOM-0415) 定位

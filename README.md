@@ -34,11 +34,18 @@
 
 | 工具 | 用途 |
 |---|---|
-| `cdp.js` | CDP 驱动（人类节奏、拟人鼠标轨迹、逐键输入）|
-| `incog.js` | 无痕 browserContext 管理（隔离登录态，避免上下文污染）|
-| `mailbox.py` | Cloudflare temp-email worker 客户端（建址/收信/取码）|
-| `detect_gap.py` | 滑块缺口检测（模板匹配）|
-| `flows/*` | 完整流程脚本：填表 → 滑块 → 验证码 → baxia 分析 → 抓包存档 |
+| `cdp.js` | **CDP 驱动**：拟人鼠标轨迹（贝塞尔曲线+抖动）、逐键输入、随机延迟。所有脚本的地基 |
+| `incog.js` | **无痕上下文管理**：规避登录态重定向；每次失败后重建，避免 React/baxia 状态污染 |
+| `mailbox.py` | **临时邮箱客户端**：建地址 → 收信 → 提取 6 位验证码（`x-admin-auth` + Bearer JWT）|
+| `detect_gap.py` | **滑块缺口检测**：拼图块不透明像素做模板匹配，输出缺口 x 坐标 |
+| `flows/page-submit.js` | **注册第 1 步**：填姓名/邮箱 → 提交。含 antd Form 实例绕过（`__reactFiber$` + `setFieldsValue`）|
+| `flows/step2-submit.js` | **注册第 2 步**：填密码 → 提交 → 触发滑块 |
+| `flows/solve-slider6.js` | **滑块自动求解**：缺口检测 + 三段式闭环拖拽（实测拼图/手柄比例 ≈0.91）|
+| `flows/type-code.js` | **填邮箱验证码**：6 位逐键输入 + 调 `onChangeCallback` 触发提交 |
+| `flows/watch-baxia2.js` | **等待 baxia 弹窗**：轮询 punish iframe 是否展示 |
+| `flows/analyze-baxia.js` | **baxia 只读分析**：导出题目图 + 9 张网格图（iframe 同源，无需逆向 WASM）|
+| `flows/capture-success.js` | **全量网络存档**：请求/响应/`bx-ua` 指纹 → JSONL，用于抓人工成功样本 |
+| `flows/net-observe.js` | **单次请求定位**：不确定按钮调什么接口时，一次看清 URL 与 body |
 
 ### ⚠️ 协助者注意事项
 

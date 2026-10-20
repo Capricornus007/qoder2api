@@ -11,6 +11,50 @@
 
 ---
 
+## 📖 [2026-10-20 更新] Qoder 注册链路逆向研究 · 阶段性成果
+
+> 独立研究文档 → **[docs/registration-research/README.md](docs/registration-research/README.md)**（点击查看完整报告）
+
+本轮对 Qoder **Web 端注册流程**做了完整协议还原，主要发现：
+
+| # | 发现 | 说明 |
+|---|---|---|
+| 1 | **真注册接口** | `POST /api/v1/users`（不是 `/users/sign-up`，后者只是前端路由）|
+| 2 | **两轮人机验证** | ① AliyunCaptcha 2.0 滑块（scene `1r7eif79x`）② 阿里 baxia 风控 + 3×3 网格点选（`RGV587` 触发）|
+| 3 | **baxia 可完整解析** | iframe 同源可访问，WASM 解密后经 `putImageData` 写 canvas，**`getImageData` 直接读到明文图片**（样本图片见 `artifacts/baxia/`）|
+| 4 | **★ 设备↔账号绑定** | App 登录会打开 `/device/selectAccounts?nonce=` → 「继续使用此账户吗？」→ 服务端按设备维护账号关联表 |
+| 5 | **★ 权益消失机制** | 网页注册可拿到 **300 积分 + Pro Trial**；同设备登录 App 后消失 → 与 `machineid = f(IOPlatformSerialNumber)` 的设备识别一致（见 `../resetfree/`）|
+| 6 | **剩余卡点** | 题目文字为 anti-OCR 像素图（tesseract 全败），需多模态视觉识别；`bx-ua` 指纹算法未解 |
+
+**欢迎社区接力**：多模态识别方案 / baxia `bx-ua` 算法 / 设备绑定接口细节。
+
+### 🧰 配套工具包
+
+本轮沉淀的可复用工具已整理到 **[tools/qoder-register-kit/](tools/qoder-register-kit/README.md)**：
+
+| 工具 | 用途 |
+|---|---|
+| `cdp.js` | CDP 驱动（人类节奏、拟人鼠标轨迹、逐键输入）|
+| `incog.js` | 无痕 browserContext 管理（隔离登录态，避免上下文污染）|
+| `mailbox.py` | Cloudflare temp-email worker 客户端（建址/收信/取码）|
+| `detect_gap.py` | 滑块缺口检测（模板匹配）|
+| `flows/*` | 完整流程脚本：填表 → 滑块 → 验证码 → baxia 分析 → 抓包存档 |
+
+### ⚠️ 协助者注意事项
+
+1. **合规**：本工具包仅供**协议研究与学习**；请勿用于批量注册、绕过风控或商业化滥用，
+   并遵守目标站点服务条款与当地法律法规。
+2. **不要提交凭证**：admin passkey、账号密码、`bx-ua` 指纹等**禁止入库**；
+   抓包存档提交前必须脱敏。
+3. **保持人类节奏**：`cdp.js` 内置随机延迟与拟人轨迹，请勿移除——高频请求会触发风控，
+   也会影响其他人的研究。
+4. **可回滚**：所有实验仅在浏览器无痕上下文内进行，不改动系统配置与硬件信息。
+5. **提交前自检**：`git diff` 确认无凭证、无 `node_modules`、无个人数据。
+
+> ⚠️ 研究性质声明：仅做协议与机制分析，不提供绕过验证的成品工具。
+
+---
+
 ## 🙏 特别致谢 · 贡献者
 
 本项目的海外版签到、多账号池、图片输入等核心特性由社区贡献者 **[LeonardW-sl](https://github.com/LeonardW-sl)** 主导实现，特此致以诚挚谢意。

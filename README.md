@@ -162,6 +162,35 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 
 ## 更新记录
 
+### 🌐 国际版签到的账号差异（灰度投放）
+
+**2026-10-20 CST**
+
+国际版（`qoder.com`）的活动是**按账号灰度投放**的，不同账号拿到的活动**不重叠**。实测两个账号：
+
+| | `yusheng zheng`（老号） | `tmpreg gep`（新号） |
+|---|---|---|
+| 注册时间 / 方式 | 2026-07-29 · `sso.google` | 2026-10-11 · `dashboard.email_pwd` |
+| **每日签到**（每天 100 Credits） | ✅ 可正常自动签到 | ❌ 服务端未下发 |
+| **SOTA 专属积分**（2000，限 Sonus 模型） | ❌ 未下发 | ✅ 已领取 |
+
+两点结论：
+
+1. **老号签到正常，但没有 SOTA 专属积分** —— 自动签到只覆盖「每日签到」这一类活动
+2. **新号无签到，但有 SOTA 积分** —— 用新号的 SOTA 包 ID 给老号代领会返回
+   `CAMPAIGN_NOT_FOUND`（服务端校验活动归属），说明这是运营灰度，不是接口或指纹问题
+
+> 即：**自动签到能领的活动范围，取决于服务端给该账号下发了什么**。
+> qoder2api 只负责把已下发的 `CLAIM_BENEFIT` 活动自动领掉，无法代领未下发的活动。
+
+#### 官方 App 中的 SOTA 专属积分
+
+![国际版 App 的 SOTA 专属积分面板](docs/img/sota-credits-app.jpg)
+
+#### qoder2api 控制台展示效果
+
+![qoder2api 控制台账号额度列表](docs/img/console-account-packages.jpg)
+
 ### 📋 模型总表（2026-10-20 实拉）
 
 模型清单由上游 `GET /algo/api/v2/model/list` 在运行时动态拉取，下方为当时快照，仅供对照；

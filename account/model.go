@@ -59,6 +59,7 @@ type Settings struct {
 	ModelMappings        map[string]map[string]string `json:"model_mappings,omitempty"`     // agent (claude/codex/gemini) → 客户端模型名 → Qoder model.key
 	AutoCheckin          bool                         `json:"auto_checkin"`                 // 自动签到开关（默认关闭）
 	AutoCheckinTimes     []string                     `json:"auto_checkin_times,omitempty"` // 自动签到时间点，HH:MM 列表，如 ["09:15","17:00"]；空=10:00
+	AutoRefreshToken     bool                         `json:"auto_refresh_token"`           // 自动续期 token 开关（默认关闭）；开启后每 15 天用 refresh_token 换新 token
 	MachineSalt          string                       `json:"machine_salt,omitempty"`       // 本机设备指纹盐（首次启动自动生成；勿修改，变更即指纹漂移）
 }
 

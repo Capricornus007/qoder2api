@@ -211,7 +211,76 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 
 ---
 
+## ✨ 新功能：Token 自动续期（15 天）
+
+账号的 access token 与 refresh token 均有有效期。此前 bridge **只保存 refresh_token 却从不使用它**，
+一旦两个 token 双双过期，账号会静默失效（控制台额度显示为空、请求 `401 TOKEN_EXPIRE`），只能重新走 OAuth。
+
+本功能利用 Qoder jobToken 端点的 `needRefresh` 模式（传入 `drt-` 前缀的 refresh_token，服务端签发新
+access token 并回传新的 refresh_token）在过期前**主动续期**。
+
+- **⏰ 定时续期**：默认**关闭**，开启后每 6 小时检查一次；token 年龄 ≥ 12 天自动续期（间隔 15 天，留 3 天余量）
+- **🖱️ 手动续期**：控制台「续期 Token」按钮一键续期；「强制续期」忽略年龄窗口
+- **📊 状态可见**：账号表格新增「Token 续期」列，显示 token 年龄、状态徽章、失败原因、下次续期日期
+- **🔀 多模式兼容**：
+  - OAuth 账号：优先用 `refresh_token`（同时拿到新 at + rt），无 rt 时回退 `device_token`
+  - PAT 账号：跳过（每次请求实时交换，无需续期）
+  - 无 secret 账号：跳过
+- **🔁 续期后需重启 Bridge**：续期写入新的 secret 文件，重启后生效（界面会提示）
+
+### 使用方式
+
+控制台「账号列表 / 额度」区域新增一行控制条：
+
+```
+[续期 Token]  [☑ 自动续期(15天)]  [强制续期]   每 15 天自动续期（token 满 12 天触发）
+```
+
+对应接口：
+
+| 接口 | 说明 |
+|------|------|
+| `GET /api/refresh` | 续期状态（开关、间隔、各账号 token 年龄、上次结果） |
+| `POST /api/refresh/run` | 手动续期（跳过未满 12 天的账号） |
+| `POST /api/refresh/run?force=1` | 强制续期全部账号 |
+
+### 续期失败的常见原因
+
+| 报错 | 原因 | 处理 |
+|------|------|------|
+| `personal token is invalid` | refresh_token 本身已过期 | 只能重新 OAuth / PAT 授权 |
+| `TOKEN_EXPIRE` | device_token 已过期但 rt 仍有效 | 续期会自动处理 |
+| `secret 中既无 refresh_token 也无 device_token` | 早期版本只存了 PAT | 重新添加账号 |
+
+> ⚠️ 本功能是**预防性**的：若 token 已彻底死亡（at 和 rt 同时失效），续期无法救回，
+> 必须重新授权。建议开启自动续期避免再次发生。
+
 ## 更新记录
+
+### 🔐 新增：Token 自动续期（15 天）
+
+**2026-10-21**
+
+修复「账号 token 过期后静默失效」问题：bridge 早前只保存 `refresh_token` 却从未使用，
+双 token 同时过期后只能重新走 OAuth。
+
+**改动**：
+
+| 文件 | 内容 |
+|------|------|
+| `refresh.go` (新增) | 续期核心逻辑 + 调度器 + HTTP handlers |
+| `account/model.go` | `Settings` 新增 `auto_refresh_token` 字段 |
+| `account/secret.go` | 导出 `SecretPathFor()`（供 token 年龄判断） |
+| `main.go` | 注册 `/api/refresh` 路由 + 启动调度器 + settings 支持 |
+| `webconsole/index.html` | 账号表格新增「Token 续期」列 + 续期控制条 |
+
+**机制**：调用已有的 `cosy.ExchangeJobToken` 并传入 `drt-` 前缀 token 触发 `needRefresh` 模式，
+服务端返回新的 access token 与 refresh token。token 年龄 ≥ 12 天触发（间隔 15 天）。
+
+**调度**：默认关闭；开启后每 6 小时检查一次，启动时延迟 45s 先跑一次让控制台有状态。
+
+**测试覆盖**：死号（401 明确报错）/ PAT 模式（跳过）/ 无 secret（跳过）/ 新 token（跳过）/
+开关持久化（重启后保持）。
 
 ### 🌐 国际版签到的账号差异（灰度投放）
 

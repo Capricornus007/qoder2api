@@ -311,43 +311,38 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 
 ![qoder2api 控制台账号额度列表](docs/img/console-account-packages.jpg)
 
-### 📋 模型总表（2026-10-20 实拉）
+### 📋 模型总表（2026-10-22 实拉）
 
 模型清单由上游 `GET /algo/api/v2/model/list` 在运行时动态拉取，下方为当时快照，仅供对照；
 实际以 `/v1/models` 返回为准。`price_factor` 为相对倍率，`0` 表示限免。
 
 > ⚠️ 同一 key 在**两区的推理支持与最大输出可能不同**（上游按区配置），故分表列出。
 
-#### 国内版 · 14 个（Bridge `8963`）
+#### 国内版 · 11 个（Bridge `8963`）
 
 | Key | 显示名 | 上下文 | 最大输出 | 倍率 | 推理 |
 |-----|--------|--------|----------|------|:----:|
 | `auto` | Auto | 200,000 | 32,768 | 0.5 | ✅ |
 | `qmodel_38max` | Qwen3.8-Max | 200,000 | 32,768 | **0.2** | ✅ |
 | `qfmodel` | Qwen3.8-Flash | 200,000 | 32,768 | **0** 🆓 | ✅ |
-| `qmodel_latest` | Qwen3.7-Max | 200,000 | 32,768 | 0.5 | ✅ |
 | `qmodel` | Qwen3.7-Plus | 200,000 | 32,768 | 0.1 | ✅ |
-| `q37fmodel` | Qwen3.7-Flash | 200,000 | 32,768 | 0.1 | ✅ |
 | `dmodel` | DeepSeek-V4-Pro | 200,000 | 32,768 | **0.5** | ✅ |
 | `dfmodel` | DeepSeek-Flash | 200,000 | 16,384 | **0** 🆓 | — |
 | `gmodel` | GLM-5.3 | 200,000 | 32,768 | **0.8** | ✅ |
 | `gfmodel` | GLM-5.3-Flash | 200,000 | 32,768 | 0.1 | ✅ |
-| `gm51model` | GLM-5.2 | 200,000 | 32,768 | 0.6 | ✅ |
 | `kmodel_latest` | Kimi-K3 | 200,000 | 16,384 | **1.4** | — |
 | `kmodel` | Kimi-K2.8-Preview | 200,000 | 32,768 | **0.8** | ✅ |
 | `mmodel` | **MiniMax-M3.1-Flash** | 200,000 | 16,384 | 0.1 | — |
 
-#### 国际版 · 15 个（Bridge `8964`）
+#### 国际版 · 13 个（Bridge `8964`）
 
 | Key | 显示名 | 上下文 | 最大输出 | 倍率 | 推理 |
 |-----|--------|--------|----------|------|:----:|
 | `auto` | Auto | 200,000 | 16,384 | 0.5 | — |
 | `ultimate` | Ultimate | 200,000 | 32,768 | 0.4 | ✅ |
-| `performance` | Performance | **272,000** | 16,384 | 1.1 | — |
 | `efficient` | Efficient | 200,000 | 16,384 | 0.3 | — |
 | `qmodel_38max` | Qwen3.8-Max | 200,000 | 32,768 | **0.2** | ✅ |
 | `qfmodel` | Qwen3.8-Flash | 200,000 | 32,768 | **0** 🆓 | ✅ |
-| `qmodel_latest` | Qwen3.7-Max | 200,000 | 16,384 | 0.5 | — |
 | `qmodel` | Qwen3.7-Plus | 200,000 | 16,384 | 0.1 | — |
 | `dmodel` | DeepSeek-V4-Pro | 200,000 | 32,768 | **0.5** | ✅ |
 | `dfmodel` | DeepSeek-Flash | 200,000 | 32,768 | **0** 🆓 | ✅ |
@@ -361,12 +356,21 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 
 | 差异 | 详情 |
 |------|------|
-| 国际独占 | `ultimate` / `performance`（272K 上下文，全库最大）/ `efficient` |
-| 国内独占 | `q37fmodel`（Qwen3.7-Flash）/ `gm51model`（GLM-5.2） |
-| 推理标记不同 | `auto` / `kmodel` / `qmodel` / `qmodel_latest` 国内支持、国际不支持；`dfmodel` 反之 |
+| 国际独占 | `ultimate` / `efficient` |
+| 推理标记不同 | `auto` / `kmodel` / `qmodel` 国内支持、国际不支持；`dfmodel` 反之 |
 | 最大输出不同 | 多数模型国内 32,768、国际 16,384；`dfmodel` 相反 |
 
-> 加粗为本次（2026-10-20）相对上一版的价格变动。
+> 加粗为相对上一版的价格变动。
+
+#### ⚠️ SOTA「Sonus」模型不在公开清单内
+
+持有 **SOTA 专属积分**的账号，官方 App 的模型选择器里会多出一个 **Sonus** 模型
+（积分说明：选择 Sonus 时优先抵扣该积分）。但它**不通过 `/algo/api/v2/model/list` 下发**：
+
+- 实测持有该积分的账号（`tmpreg gep`）直接调 `model/list` 仍只返回上表 13 个，无 Sonus
+- 客户端包内检索 `sonus` 仅有无关的 `sonus.multitrack`；`/sash/api/v1/me/achievements` 返回空
+
+即 **Sonus 是官方 App 侧按账号特殊展示的模型，API 侧不可见**，因此 qoder2api 无法转发该模型。
 
 ### 🔄 上游模型清单更新
 

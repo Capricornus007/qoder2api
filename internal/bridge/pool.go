@@ -277,6 +277,11 @@ func ShouldFailover(err error) bool {
 		if ue.ErrType == ErrTypeContentPolicy {
 			return false
 		}
+		// 队列拥塞：换号无益（同模型同队列），且已在 streamWithSlot 内同账号
+		// 等待重试；直接上抛友好错误，不冷却、不换号。
+		if ue.ErrType == ErrTypeUpstreamQueue {
+			return false
+		}
 		switch ue.Status {
 		case http.StatusUnauthorized, http.StatusForbidden: // 额度 / 凭证
 			return true

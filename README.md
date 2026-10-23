@@ -272,6 +272,70 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 
 ## 更新记录
 
+### 🎚️ 新增：Context 多档位支持（200K / 400K / 1M）
+
+**2026-10-23**
+
+上游 `model/list` 的 `context_config` 按模型提供多档 context，但 bridge 此前只取
+`is_default` 那一档（通常 200K），导致 400K / 1M 档位在 `/v1/models` 中不可见，
+App 端能选到的大 context 在 bridge 侧完全丢失。
+
+**改动**：
+
+| 文件 | 内容 |
+|------|------|
+| `internal/bridge/bridge.go` | `QoderModel` 新增 `ContextTiers`；`parseQoderModels` 保留全部档位；新增 `resolveContextTokens` / `contextTierTokens` / `modelCatalog`（5 分钟缓存）|
+| `internal/bridge/context_tier_test.go` (新增) | 档位解析、排序、默认档回退、大小写不敏感等用例 |
+| `account/model.go` | `Settings` 新增 `context_tier_default` 与 `context_tier_overrides` |
+| `service.go` | `ListQoderModels` 透出 `context_tiers` |
+| `main.go` | settings 保存支持档位字段 |
+| `webconsole/index.html` | 模型表格新增「可用档位」列；模型区新增档位下拉与保存按钮 |
+
+**使用**：控制台「模型」区域顶部选择档位（如 `400K`），保存后对该实例所有模型生效；
+留空 = 用上游默认档。请求时把所选 token 数写入 `model_config.max_input_tokens`。
+
+> ⚠️ **未证实**：上游 `context_config` 的结构已从抓包确认，但「App 端用哪个请求字段
+> 传递所选档位」尚未抓到真实模型请求验证。当前按最可能的 `model_config.max_input_tokens`
+> 实现（该字段已存在于请求模板）。若实测不生效，需抓一次 App 的
+> `agent_chat_generation` 请求确认字段名。
+
+**实测档位分布**（`scripts/capture/` 抓包，15 个模型中 12 个有三档）：
+
+| 模型 | 档位 |
+|------|------|
+| `qmodel_38max` / `qfmodel` / `dmodel` / `dfmodel` / `gfmodel` 等 | 200K / 400K / 1M |
+| `ultimate` / `fast` / `smodel` / `cmodel` 等 | 200K / 400K / 1M |
+| `auto` / `efficient` | 仅 200K |
+
+
+### 🔁 改进：模型排队改为「同账号等待重试 + 友好提示」（2026-10-23）
+
+**2026-10-23 CST**
+
+热门模型（如 Sonus，倍率 8）被大量占用时，上游返回 `10605 isQueued`（带 `queueCount` /
+`retryAfterSeconds`）。此前桥接把它误判为「无权限」（RESOURCE_LIMIT），于是**换号 + 冷却全部账号**，
+最终回 `no_available_account` 直接报错断开——而换号对同模型同队列毫无帮助。
+
+**改动**：
+
+| 文件 | 内容 |
+|------|------|
+| `internal/bridge/errors.go` | `isQueued`/`retryAfterSeconds` 一律判为**可重试拥塞**（`upstream_queued`）；消息含「前方排队人数 + 预计等待秒数」；新增 `isUpstreamQueue` / `queueRetryAfter` |
+| `internal/bridge/pool.go` | `ShouldFailover` 对队列错误返回 **false**（不换号、不冷却） |
+| `internal/bridge/bridge.go` | `streamWithSlot` 外层新增**同账号排队重试**：等待 `retryAfterSeconds`（夹在 1s~30s）后重试，最多 2 次 |
+
+**新行为**：
+
+- 命中排队 → **在原账号上等待 ~30s 重试**（最多 2 次，共 ~60s），撑到队列疏通常能成功；
+  期间不切换、不冷却账号，其他模型不受影响。
+- 仍未疏解 → 返回友好错误（HTTP 503）：`模型 X 当前使用人数较多，正在排队（前方约 N 人），
+  预计还需等待约 M 秒…`，客户端稍后重试或改用其他模型即可。
+
+> 排队重试参数**控制台可配、热更新生效**（`NewAPI / 中转站接入` 卡片 → 「模型排队重试」）：
+> **最多重试次数**（默认 2，范围 1~10）、**单次等待上限**（默认 30s，范围 1~300）、
+> **默认等待**（上游未给 retryAfter 时，默认 15s）。实际单次等待 = `min(上游 retryAfterSeconds, 等待上限)`。
+> 保存后即时生效，无需重启。
+
 ### 🆕 新增：新版推理协议解锁 Sonus / Cantus / Fast（2026-10-23）
 
 **2026-10-23 CST**

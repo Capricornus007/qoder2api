@@ -1,6 +1,7 @@
 package account
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -96,5 +97,35 @@ func TestLoadSettingsDefaultsBothPorts(t *testing.T) {
 	got, _ = LoadSettings()
 	if got.CNPort != DefaultCNPort || got.GlobalPort != DefaultGlobalPort {
 		t.Fatalf("0/0 should fall back to defaults, got CN %d Global %d", got.CNPort, got.GlobalPort)
+	}
+}
+
+// 旧版单桥 settings.json 的迁移：port/bridge_token 必须落到分区字段，
+// 且旧 --instance=global 的 8964 不能被同时当成 CN。
+func TestLoadSettingsMigratesLegacySingleBridge(t *testing.T) {
+	SetDataRoot(t.TempDir())
+	legacy := `{"port":8963,"bridge_token":"legacy-key","log_level":"debug"}`
+	if err := os.WriteFile(settingsPath(), []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.CNPort != 8963 || st.GlobalPort != DefaultGlobalPort {
+		t.Fatalf("legacy 8963 = CN %d Global %d, want 8963/%d", st.CNPort, st.GlobalPort, DefaultGlobalPort)
+	}
+	if st.CationToken != "legacy-key" || st.GlobalToken != "legacy-key" {
+		t.Fatalf("legacy token not split: %+v", st)
+	}
+
+	SetDataRoot(t.TempDir())
+	legacyGlobal := `{"port":8964}`
+	if err := os.WriteFile(settingsPath(), []byte(legacyGlobal), 0600); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = LoadSettings()
+	if st.CNPort != 0 || st.GlobalPort != 8964 {
+		t.Fatalf("legacy 8964 = CN %d Global %d, want 0/8964", st.CNPort, st.GlobalPort)
 	}
 }

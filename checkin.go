@@ -72,28 +72,53 @@ var checkinClient = &http.Client{
 // 必须携带完整 cosy 设备指纹：国际版缺少这些头时服务端不下发签到活动。
 // checkinHeaders 构造签到请求头。
 //
-// 关键结论（2026-10-13 实测）：
-//   - `cosy-machinetoken` 是**服务端签发**的设备令牌，客户端自造的任何值
-//     （无论长度/格式是否正确）都会导致服务端不下发 CLAIM_BENEFIT 签到活动，
-//     表现为「无可用签到活动」。空值（不发送该头）反而放行。
-//   - 同一实验证明 machineid / machinetype / machinecode / hostname / os
-//     的取值均不影响活动下发。
+// 关键结论（2026-10-13 对照实验，单变量逐一验证）：
 //
-// 因此签到**只发送必要头**：auth + clienttype + 通用 UA/语言，
-// **刻意不发** cosy-machinetoken 及其余自造指纹，避免被判定为伪造设备。
-func checkinHeaders(deviceToken string) map[string]string {
-	return map[string]string{
+//	国内版（openapi.qoder.com.cn）：
+//	  - 发送自造 cosy-machinetoken → 服务端不下发 CLAIM_BEFEFIT 活动（no_campaign）
+//	  - 完全不发送指纹头            → 正常下发 ✅
+//	  - 因此 CN 只发必要头，刻意不发自造指纹
+//
+//	国际版（openapi.qoder.sh）：
+//	  - 不发送指纹头                → 不下发活动 ❌
+//	  - 发送官方客户端真实指纹      → 正常下发 ✅
+//	  - 自造指纹同样无效（服务端校验签发来源）
+//	  - 因此 Global 需要从账号配置读取官方抓包指纹
+//
+// fp 为 nil 时只发必要头（CN 行为）。
+func checkinHeaders(deviceToken string, fp *account.CheckinFingerprint) map[string]string {
+	h := map[string]string{
 		"authorization":   "Bearer " + deviceToken,
 		"accept":          "application/json",
 		"accept-language": "zh-CN",
 		"user-agent":      "Qoder",
 		"cosy-clienttype": "10",
 	}
+	// 有真实指纹才附带（国际版必需；国内版留空）
+	if fp != nil && fp.MachineToken != "" {
+		h["cosy-version"] = orDefault(fp.Version, "0.4.4")
+		h["cosy-machineid"] = fp.MachineID
+		h["cosy-machinetoken"] = fp.MachineToken
+		h["cosy-machinetype"] = fp.MachineType
+		if fp.MachineCode != "" {
+			h["cosy-machinecode"] = fp.MachineCode
+		}
+		h["cosy-machinehostname"] = orDefault(fp.Hostname, "localhost")
+		h["cosy-machineos"] = orDefault(fp.MachineOS, "aarch64_darwin")
+	}
+	return h
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
 }
 
 // doCheckinRequest 发送签到相关请求，返回 (httpStatus, parsedJSON, rawBody)
 // reqBody 为 nil 时发送空 body（抓包确认 campaigns/claim 即为空 body）
-func doCheckinRequest(method, path, deviceToken string, reqBody interface{}, host string) (int, interface{}, string) {
+func doCheckinRequest(method, path, deviceToken string, reqBody interface{}, host string, fp *account.CheckinFingerprint) (int, interface{}, string) {
 	if host == "" {
 		host = checkinHost
 	}
@@ -109,7 +134,7 @@ func doCheckinRequest(method, path, deviceToken string, reqBody interface{}, hos
 	if err != nil {
 		return 0, nil, fmt.Sprintf("build request: %v", err)
 	}
-	for k, v := range checkinHeaders(deviceToken) {
+	for k, v := range checkinHeaders(deviceToken, fp) {
 		req.Header.Set(k, v)
 	}
 	if method == "POST" {
@@ -336,10 +361,10 @@ func checkinAccount(acct *account.Account) CheckinResult {
 	host := checkinHostFor(acct.Region)
 	// 指纹 seed 优先用账号 ID（签到不做 userinfo 往返，且账号 ID 稳定唯一），
 	// 退回凭证种子，与 Bridge 的 uid 派生保持同一套设备身份。
-	r := campaignsCheckin(deviceToken, &res, host)
+	r := campaignsCheckin(deviceToken, &res, host, acct.CheckinFingerprint)
 
 	// 只读补充 legacy 统计（DISABLED 时恒 0，不影响结果；上游恢复后可提供 streak）
-	readDailyCheckinStats(deviceToken, &r, host)
+	readDailyCheckinStats(deviceToken, &r, host, acct.CheckinFingerprint)
 
 	return finalizeCheckin(acct.ID, r)
 }
@@ -370,8 +395,8 @@ func finalizeCheckin(accountID string, r CheckinResult) CheckinResult {
 // 背景：该端点的 legacy 活动已 DISABLED，claim 会恒返回 409 造成误判，
 // 且不发放任何积分（2026-09-21 实测）。真实领取只走 campaigns 流程。
 // 上游恢复后若返回非 0 统计，可作为 streak 的补充数据源。
-func readDailyCheckinStats(deviceToken string, res *CheckinResult, host string) {
-	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/daily-check-in/status", deviceToken, nil, host)
+func readDailyCheckinStats(deviceToken string, res *CheckinResult, host string, fp *account.CheckinFingerprint) {
+	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/daily-check-in/status", deviceToken, nil, host, fp)
 	if status != 200 {
 		if status != 404 && status != 401 {
 			logger.Info("[Checkin] daily-check-in/status HTTP %d: %s", status, truncate(raw, 150))
@@ -437,9 +462,9 @@ func windowHint(res *CheckinResult, fallback string) string {
 }
 
 // campaignsCheckin 兜底：走桌面端抓包还原的 campaigns 流程
-func campaignsCheckin(deviceToken string, res *CheckinResult, host string) CheckinResult {
+func campaignsCheckin(deviceToken string, res *CheckinResult, host string, fp *account.CheckinFingerprint) CheckinResult {
 	// Step 1: 查询活动列表
-	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/campaigns", deviceToken, nil, host)
+	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/campaigns", deviceToken, nil, host, fp)
 	if status != 200 {
 		res.Message = fmt.Sprintf("查询活动失败 HTTP %d: %s", status, truncate(raw, 300))
 		return *res
@@ -496,13 +521,23 @@ func campaignsCheckin(deviceToken string, res *CheckinResult, host string) Check
 		} else {
 			res.Status = checkinStatusNoCampaign
 			res.Message = "无可用签到活动"
+			// 打印原始活动列表，便于排查「为何不下发 CLAIM_BENEFIT」。
+			// 已知原因（见 issue #4）：Global 账号首次领取前需携带官方真实
+			// cosy 设备指纹（machineid + machinetoken + machinetype），否则
+			// 服务端按账号灰度不下发活动；首次领取后转为懒下发，之后无需指纹。
+			actionTypes := make([]string, 0, len(campaigns))
+			for i := range campaigns {
+				actionTypes = append(actionTypes, campaigns[i].ActionType+"/"+campaigns[i].ClaimStatus)
+			}
+			logger.Info("[Checkin] no CLAIM_BENEFIT: account fingerprint=%v, campaigns=%v, raw=%s",
+				fp != nil, actionTypes, truncate(raw, 400))
 		}
 		return *res
 	}
 
 	// Step 2: 领取（空 body，抓包确认）
 	claimPath := fmt.Sprintf("/sash/api/v1/me/campaigns/%s/claim", target.CampaignID)
-	status, body, raw = doCheckinRequest("POST", claimPath, deviceToken, nil, host)
+	status, body, raw = doCheckinRequest("POST", claimPath, deviceToken, nil, host, fp)
 	if status != 200 {
 		res.Message = fmt.Sprintf("领取失败 HTTP %d: %s", status, truncate(raw, 300))
 		return *res

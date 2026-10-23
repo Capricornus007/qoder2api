@@ -109,6 +109,13 @@ func ensureConsolePassword() string {
 	cur.ConsolePassword = p
 	// 直接落盘而非走 svc.SaveSettings：启动阶段还没有桥，不需要触发端口重启
 	_ = account.SaveSettings(cur)
+	// 这里只同步两区 token，不覆盖端口：端口优先级由 main 的
+	// --cn-port/--global-port 决定，避免 settings 默认值把显式端口冲掉。
+	if svc != nil {
+		svc.mu.Lock()
+		svc.cnToken, svc.globalToken = cur.CationToken, cur.GlobalToken
+		svc.mu.Unlock()
+	}
 	logger.Info("console password auto-generated (saved to settings): %s", p)
 	logger.Info("override with env QODER2API_CONSOLE_PASSWORD or settings.console_password")
 	return p

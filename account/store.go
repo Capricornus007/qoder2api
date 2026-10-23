@@ -80,6 +80,16 @@ func SetActiveForRegion(region Region, id string) error {
 	return nil
 }
 
+// SetActive 是上游 API 的兼容包装：按账号自身 region 作用，等价于
+// SetActiveForRegion(acct.Region, id)。
+func SetActive(id string) error {
+	acct, err := Get(id)
+	if err != nil {
+		return err
+	}
+	return SetActiveForRegion(acct.Region, id)
+}
+
 // GetActiveForRegion 返回该区域的激活账号；没有则返回 nil（另一区的激活账号不会被误取）。
 func GetActiveForRegion(region Region) (*Account, error) {
 	accounts, err := List()
@@ -90,6 +100,23 @@ func GetActiveForRegion(region Region) (*Account, error) {
 	for i := range accounts {
 		if accounts[i].Region.Normalized() == want && accounts[i].Active {
 			return &accounts[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// GetActiveByRegion 是上游命名的兼容别名，行为与 GetActiveForRegion 一致。
+func GetActiveByRegion(region Region) (*Account, error) {
+	return GetActiveForRegion(region)
+}
+
+// GetActive 返回任意一个激活账号（上游兼容 API）。双桥下优先 CN，再 Global。
+func GetActive() (*Account, error) {
+	for _, r := range Regions {
+		if acct, err := GetActiveForRegion(r); err != nil {
+			return nil, err
+		} else if acct != nil {
+			return acct, nil
 		}
 	}
 	return nil, nil
@@ -217,6 +244,25 @@ func LoadSettings() (*Settings, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, err
 	}
+	// 旧版单桥 settings.json 迁移：port/bridge_token 是上游字段。
+	// 迁移后清空，避免下次保存继续写废弃字段。
+	if s.CNPort == 0 && s.GlobalPort == 0 && s.Port > 0 {
+		if s.Port == DefaultGlobalPort {
+			// 旧 --instance=global 的单桥设置：它原本就是 Global 端口，
+			// 不能同时当成 CN，否则两桥会抢同一端口。
+			s.GlobalPort = s.Port
+		} else {
+			s.CNPort = s.Port
+			s.GlobalPort = DefaultGlobalPort
+		}
+	}
+	if s.CationToken == "" && s.GlobalToken == "" && s.BridgeToken != "" {
+		// 旧版两桥共用一把 key：拆到两区，行为保持不变
+		s.CationToken = s.BridgeToken
+		s.GlobalToken = s.BridgeToken
+	}
+	s.Port = 0
+	s.BridgeToken = ""
 	if s.CNPort == 0 && s.GlobalPort == 0 {
 		// 两侧都为 0 会让服务没有任何 API 端口，视为未配置 → 回到默认双桥
 		s.CNPort = DefaultCNPort

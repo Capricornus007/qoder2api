@@ -143,6 +143,33 @@
       border-left: 2px solid #4caf50;
       margin-top: 0;
     }
+    /* 账号列表按 region 分组的标题行 */
+    .region-row td {
+      background: #f0efec;
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: .04em;
+      color: #444;
+      border-top: 2px solid #d6d3cc;
+      border-bottom: 1px solid var(--line);
+      padding: 8px;
+    }
+    .region-row .region-tag {
+      display: inline-block;
+      padding: 1px 8px;
+      border-radius: 4px;
+      background: #444;
+      color: #fff;
+      margin-right: 8px;
+      font-size: 11px;
+    }
+    .region-row .region-tag.gl { background: #1a7f37; }
+    .region-row .region-active {
+      color: var(--muted);
+      font-weight: 400;
+      letter-spacing: 0;
+      margin-left: 8px;
+    }
     .bar {
       height: 5px;
       background: #eee;
@@ -238,6 +265,16 @@
         <button class="secondary" id="autoCheckinTimesSave">保存时间</button>
         <span class="msg" id="checkinMsg"></span>
       </div>
+      <div class="row" style="margin-bottom:12px">
+        <button class="secondary" id="refreshTokenBtn">续期 Token</button>
+        <label class="pill" style="cursor:pointer; margin-bottom:0">
+          <input type="checkbox" id="autoRefreshToggle" style="width:auto; margin-right:6px">
+          自动续期(15天)
+        </label>
+        <button class="secondary" id="refreshForceBtn">强制续期</button>
+        <span class="muted" id="refreshHint"></span>
+        <span class="msg" id="refreshMsg"></span>
+      </div>
       <div id="checkinResult" style="margin-bottom:12px; display:none">
         <pre id="checkinBox"></pre>
       </div>
@@ -247,11 +284,12 @@
             <th>账号</th>
             <th>Plan / 模式</th>
             <th>额度</th>
+            <th>Token 续期</th>
             <th>操作</th>
           </tr>
         </thead>
         <tbody id="accountBody">
-          <tr><td colspan="4" class="muted">加载中...</td></tr>
+          <tr><td colspan="5" class="muted">加载中...</td></tr>
         </tbody>
       </table>
     </section>
@@ -265,6 +303,15 @@
             <option value="global">国际版 Global</option>
           </select>
           <button class="secondary" id="modelsRefreshBtn">重新拉取</button>
+        </div>
+        <div class="row" style="margin-bottom:10px; flex-wrap:wrap; gap:6px">
+          <label style="margin:0">Context 档位</label>
+          <select id="ctxTierGlobal" style="width:140px">
+            <option value="">上游默认</option>
+          </select>
+          <span class="muted" id="ctxTierHint">选择后对该实例所有模型生效</span>
+          <button class="secondary" id="ctxTierSave">保存</button>
+          <span class="msg" id="ctxTierMsg"></span>
         </div>
         <div id="modelsBox">加载中...</div>
       </div>
@@ -338,6 +385,22 @@
           </div>
         </div>
         
+        <div style="margin-top:12px">
+          <label>模型排队重试（上游 10605 isQueued 时，同账号等待重试；换号无益）</label>
+          <div class="row" style="gap:8px; flex-wrap:wrap; align-items:center">
+            <span style="font-size:12px">最多重试</span>
+            <input id="queueMaxRetriesInput" type="number" min="1" max="10" placeholder="2" style="width:70px" />
+            <span style="font-size:12px">次 · 单次等待上限</span>
+            <input id="queueWaitCapInput" type="number" min="1" max="300" placeholder="30" style="width:80px" />
+            <span style="font-size:12px">秒 · 默认等待</span>
+            <input id="queueWaitDefaultInput" type="number" min="1" max="300" placeholder="15" style="width:80px" />
+            <span style="font-size:12px">秒</span>
+          </div>
+          <div style="font-size:11px; color:var(--muted); margin-top:4px">
+            热门模型排队时在原账号等待后重试，撑到队列疏通常能成功；留空/0 = 用默认（2 次 / 30s / 15s）。
+          </div>
+        </div>
+
         <div style="margin-top:12px">
           <label>控制台登录密码（可修改，留空不改）</label>
           <input id="consolePasswordInput" type="password" placeholder="不修改请留空" autocomplete="new-password" style="width: 200px; margin-bottom: 6px;" />
@@ -429,6 +492,16 @@
       }
       if (document.activeElement !== $('globalPortInput')) {
         $('globalPortInput').value = (gl.port != null ? gl.port : settings.global_port != null ? settings.global_port : 8964);
+      }
+      // 排队重试参数：留空/0 显示为默认值（2 次 / 30s / 15s）
+      if (document.activeElement !== $('queueMaxRetriesInput')) {
+        $('queueMaxRetriesInput').value = Number(settings.queue_max_retries) > 0 ? settings.queue_max_retries : 2;
+      }
+      if (document.activeElement !== $('queueWaitCapInput')) {
+        $('queueWaitCapInput').value = Number(settings.queue_wait_cap_sec) > 0 ? settings.queue_wait_cap_sec : 30;
+      }
+      if (document.activeElement !== $('queueWaitDefaultInput')) {
+        $('queueWaitDefaultInput').value = Number(settings.queue_wait_default_sec) > 0 ? settings.queue_wait_default_sec : 15;
       }
 
       const region = $('connRegion') ? $('connRegion').value : 'cn';
@@ -526,14 +599,18 @@
         return '<div class="muted">暂无模型</div>';
       }
       const rows = models.map(m => {
-        const ctx = (m.max_input_tokens || m.context_window) != null ? Number(m.max_input_tokens || m.context_window).toLocaleString() : '-';
+        const ctx = (m.context_window || m.max_input_tokens) != null ? Number(m.context_window || m.max_input_tokens).toLocaleString() : '-';
         const maxOut = m.max_output_tokens != null ? Number(m.max_output_tokens).toLocaleString() : '-';
         const name = m.display_name || m.id || m.key || '-';
         const key = m.id || m.key || '-';
+        const tiers = (m.context_tiers && m.context_tiers.length)
+          ? m.context_tiers.map(t => `${t.name}${t.is_default ? '*' : ''}`).join(' / ')
+          : '-';
         return `<tr>
           <td>${name}</td>
           <td>${key}</td>
           <td>${ctx}</td>
+          <td class="muted" style="font-size:11px">${tiers}</td>
           <td>${maxOut}</td>
           <td>${m.is_reasoning ? '✅' : ''}</td>
           <td>${m.enable === false ? '❌' : '✅'}</td>
@@ -545,13 +622,15 @@
             <th>模型</th>
             <th>Key</th>
             <th>上下文</th>
+            <th>可用档位</th>
             <th>最大输出</th>
             <th>推理</th>
             <th>启用</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
-      </table>`;
+      </table>
+      <div class="muted" style="font-size:11px;margin-top:6px">* = 上游默认档位</div>`;
     }
 
     function fmtDur(ms) {
@@ -615,6 +694,41 @@
       } else {
       }
       
+      // 专属资源包（活动奖励，如 SOTA 专属积分）：单独成桶，可能带过期时间
+      const pkgs = q.dedicated_packages || [];
+      for (const p of pkgs) {
+        const u = p.used || 0;
+        const t = p.total || 0;
+        const r = p.remaining != null ? p.remaining : (t - u);
+        const pct = t > 0 ? Math.min(100, Math.round((u / t) * 100)) : 0;
+        const cls = pct >= 90 ? 'bad' : (pct >= 70 ? 'warn' : '');
+        // 标签取中文优先
+        let title = p.name || '专属资源包';
+        let desc = p.description || '';
+        for (const l of (p.labels || [])) {
+          if (l.dimension === 'title') title = (l.value_i18n && l.value_i18n['zh-CN']) || l.value || title;
+          if (l.dimension === 'description') desc = (l.value_i18n && l.value_i18n['zh-CN']) || l.value || desc;
+        }
+        // 过期提示
+        let exp = '';
+        if (p.expires_at_ms) {
+          const d = new Date(p.expires_at_ms);
+          const days = Math.ceil((p.expires_at_ms - Date.now()) / 86400000);
+          const dstr = d.toLocaleDateString('zh-CN');
+          const urgent = days <= 3 ? ' style="color:var(--bad);font-weight:600"' : '';
+          exp = `<div${urgent}>⏳ ${dstr} 过期（剩 ${days} 天）</div>`;
+        }
+        html += `
+          <div class="quota-block addon-block">
+            <strong>🎁 ${title}</strong>:
+            已用 ${fmtNum(u)} / ${fmtNum(t)} · 剩余 ${fmtNum(r)}<br/>
+            <div class="bar ${cls}"><i style="width:${pct}%"></i></div>
+            ${exp}
+            ${desc ? `<div class="muted" style="font-size:11px;margin-top:2px">${desc}</div>` : ''}
+          </div>
+        `;
+      }
+
       return html;
     }
 
@@ -625,10 +739,10 @@
       const pools = (pool && pool.pools) || [];
       pools.forEach(p => (p.slots || []).forEach(s => { poolById[s.id] = s; }));
       if (!list || !list.length) {
-        $('accountBody').innerHTML = '<tr><td colspan="4" class="muted">暂无账号</td></tr>';
+        $('accountBody').innerHTML = '<tr><td colspan="5" class="muted">暂无账号</td></tr>';
         return;
       }
-      $('accountBody').innerHTML = list.map(a => {
+      const rowHtml = (a) => {
         const cachedQuota = quotaCache[a.id];
         const slot = poolById[a.id];
         const coolMs = slot ? (slot.cooling_remaining_ms || 0) : 0;
@@ -651,6 +765,7 @@
             <div class="muted">${a.auth_mode || '-'} / ${a.api_mode || '-'} / ${a.region || 'global'}</div>
           </td>
           <td class="quota-cell" data-quota-id="${a.id}">${renderQuota(cachedQuota)}</td>
+          <td data-refresh-id="${a.id}">${renderRefreshCell(a.id)}</td>
           <td class="row">
             <button class="secondary" data-act="activate" data-id="${a.id}" ${a.active ? 'disabled' : ''}>激活</button>
             <button class="secondary" data-act="quota" data-id="${a.id}">刷新额度</button>
@@ -659,7 +774,106 @@
             <button class="danger" data-act="delete" data-id="${a.id}">删除</button>
           </td>
         </tr>
-      `}).join('');
+      `};
+      // 按 region 分区（cn 在前、global 在后），组间插入醒目标题行
+      const norm = (r) => (r === 'cn' || r === 'CN') ? 'cn' : 'global';
+      const groups = [
+        { tag: 'CN', cls: '',   title: '国内版 · Bridge 8963', arr: list.filter(a => norm(a.region) === 'cn') },
+        { tag: 'GLOBAL', cls: 'gl', title: '国际版 · Bridge 8964', arr: list.filter(a => norm(a.region) === 'global') },
+      ];
+      let html = '';
+      for (const g of groups) {
+        if (!g.arr.length) continue;
+        const act = g.arr.find(a => a.active);
+        const activeTxt = act ? (act.name || act.id) : '无（点击账号行「激活」）';
+        html += `<tr class="region-row"><td colspan="5"><span class="region-tag ${g.cls}">${g.tag}</span>${g.title}<span class="region-active">激活账号：${activeTxt}</span></td></tr>`;
+        html += g.arr.map(rowHtml).join('');
+      }
+      $('accountBody').innerHTML = html;
+    }
+
+    // ===== Token 续期 =====
+    let refreshCache = {};
+    let refreshEnabled = false;
+
+    function fmtAge(days) {
+      if (days === undefined || days === null || days < 0) return '-';
+      if (days === 0) return '今天';
+      return days + ' 天';
+    }
+
+    function renderRefreshCell(id) {
+      const ages = refreshCache.token_age_days || refreshCache.ages || {};
+      const age = ages[id];
+      const rep = refreshCache.reports && refreshCache.reports[id];
+      const badgeMap = {
+        ok:        ['#8bc34a', '#f1f8e9', '#33691e', '已续期'],
+        failed:    ['#e53935', '#ffebee', '#b71c1c', '失败'],
+        no_secret: ['#9e9e9e', '#f5f5f5', '#616161', '无凭证'],
+      };
+      const b = rep ? badgeMap[rep.status] : null;
+      const badge = b
+        ? `<span class="pill" style="border-color:${b[0]};background:${b[1]};color:${b[2]}">${b[3]}</span>`
+        : (rep && rep.status === 'not_needed' ? '<span class="muted">PAT</span>' : '');
+      const note = rep && rep.status === 'failed'
+        ? `<div class="muted" style="font-size:11px;color:#c62828" title="${(rep.message||'').replace(/"/g,'&quot;')}">${(rep.message||'').slice(0,40)}</div>`
+        : (rep && rep.status === 'ok' && rep.next_refresh_at
+          ? `<div class="muted" style="font-size:11px">下次 ${new Date(rep.next_refresh_at*1000).toLocaleDateString()}</div>`
+          : '');
+      return `<div>${badge || '<span class="muted">-</span>'}</div><div class="muted" style="font-size:11px">token ${fmtAge(age)}</div>${note}`;
+    }
+
+    async function loadRefresh() {
+      try {
+        const r = await api('/api/refresh');
+        refreshCache = r || {};
+        refreshEnabled = !!r.enabled;
+        $('autoRefreshToggle').checked = refreshEnabled;
+        $('refreshHint').textContent = `每 ${r.interval_days || 15} 天自动续期（token 满 ${r.window_days || 12} 天触发）`;
+        // 局部刷新各单元格
+        document.querySelectorAll('[data-refresh-id]').forEach(td => {
+          td.innerHTML = renderRefreshCell(td.getAttribute('data-refresh-id'));
+        });
+      } catch (e) {
+        $('refreshHint').textContent = '续期状态加载失败';
+      }
+    }
+
+    async function runRefresh(force) {
+      const btn = force ? $('refreshForceBtn') : $('refreshTokenBtn');
+      btn.disabled = true;
+      $('refreshMsg').className = 'msg';
+      $('refreshMsg').textContent = '续期中...';
+      try {
+        const r = await api('/api/refresh/run' + (force ? '?force=1' : ''), { method: 'POST', body: '{}' });
+        const parts = [];
+        if (r.renewed) parts.push(`续期 ${r.renewed} 个`);
+        if (r.failed) parts.push(`失败 ${r.failed} 个`);
+        $('refreshMsg').className = r.failed ? 'msg err' : 'msg ok';
+        $('refreshMsg').textContent = parts.join('，') || '无需续期';
+        await loadRefresh();
+        if (r.restart_required) {
+          $('refreshMsg').textContent += '（需重启 Bridge 生效）';
+        }
+        refresh();
+      } catch (e) {
+        $('refreshMsg').className = 'msg err';
+        $('refreshMsg').textContent = '失败: ' + e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function toggleAutoRefresh(on) {
+      try {
+        await api('/api/settings/save', { method: 'POST', body: JSON.stringify({ auto_refresh_token: on }) });
+        $('refreshMsg').className = 'msg ok';
+        $('refreshMsg').textContent = on ? '已开启自动续期' : '已关闭自动续期';
+      } catch (e) {
+        $('refreshMsg').className = 'msg err';
+        $('refreshMsg').textContent = '设置失败: ' + e.message;
+        $('autoRefreshToggle').checked = !on;
+      }
     }
 
     async function loadQuota(id) {
@@ -673,6 +887,62 @@
       if (cell) cell.innerHTML = renderQuota(quotaCache[id]);
     }
 
+    // ===== Context 档位 =====
+    let ctxTierCache = { options: [], default: '' };
+
+    function renderCtxTierOptions(models) {
+      const sel = $('ctxTierGlobal');
+      if (!sel) return;
+      // 收集所有模型出现过的档位名（按 token 数排序）
+      const seen = new Map();
+      (models || []).forEach(m => {
+        (m.context_tiers || []).forEach(t => {
+          if (!seen.has(t.name)) seen.set(t.name, t.tokens);
+        });
+      });
+      const opts = [...seen.entries()].sort((a, b) => a[1] - b[1]);
+      ctxTierCache.options = opts.map(([name]) => name);
+      const cur = ctxTierCache.default || '';
+      sel.innerHTML = '<option value="">上游默认</option>' +
+        opts.map(([name, tok]) =>
+          `<option value="${name}" ${name === cur ? 'selected' : ''}>${name} (${Number(tok).toLocaleString()})</option>`
+        ).join('');
+    }
+
+    async function loadCtxTier(models) {
+      try {
+        const resp = await api('/api/settings');
+        const st = (resp && resp.settings) || resp || {};
+        ctxTierCache.default = st.context_tier_default || '';
+        renderCtxTierOptions(models);
+        const hint = $('ctxTierHint');
+        if (hint) {
+          const ov = st.context_tier_overrides || {};
+          const n = Object.keys(ov).length;
+          hint.textContent = n ? `全局默认 + ${n} 个按模型覆盖` : '选择后对该实例所有模型生效';
+        }
+      } catch (e) {
+        // settings 可能未暴露这些字段（旧版本），忽略
+      }
+    }
+
+    async function saveCtxTier() {
+      const sel = $('ctxTierGlobal');
+      const val = sel ? sel.value : '';
+      try {
+        await api('/api/settings/save', {
+          method: 'POST',
+          body: JSON.stringify({ context_tier_default: val }),
+        });
+        ctxTierCache.default = val;
+        $('ctxTierMsg').className = 'msg ok';
+        $('ctxTierMsg').textContent = val ? `已设为 ${val}` : '已恢复上游默认';
+      } catch (e) {
+        $('ctxTierMsg').className = 'msg err';
+        $('ctxTierMsg').textContent = e.message;
+      }
+    }
+
     async function loadModels() {
       const region = $('modelsRegion') ? $('modelsRegion').value : 'cn';
       $('modelsBox').textContent = '加载中...';
@@ -680,6 +950,8 @@
         const res = await api('/api/models?region=' + encodeURIComponent(region));
         const models = Array.isArray(res) ? res : (res && res.data) || [];
         $('modelsBox').innerHTML = renderModelsTable(models);
+        renderCtxTierOptions(models);
+        loadCtxTier(models);
       } catch (e) {
         $('modelsBox').textContent = e.message;
       }
@@ -695,6 +967,7 @@
       }
 
       await loadConnection();
+      await loadRefresh();
 
       try {
         let pool = null;
@@ -704,7 +977,7 @@
         // 并行拉额度
         (accounts || []).forEach(a => loadQuota(a.id));
       } catch (e) {
-        $('accountBody').innerHTML = `<tr><td colspan="4" class="msg err">${e.message}</td></tr>`;
+        $('accountBody').innerHTML = `<tr><td colspan="5" class="msg err">${e.message}</td></tr>`;
       }
 
       await loadModels();
@@ -724,6 +997,13 @@
     }).catch(() => location.replace('/login.html'));
 
     $('refreshBtn').onclick = refresh;
+    $('ctxTierSave').onclick = saveCtxTier;
+
+    // ===== Token 续期按钮绑定 =====
+    $('refreshTokenBtn').onclick = () => runRefresh(false);
+    $('refreshForceBtn').onclick = () => runRefresh(true);
+    $('autoRefreshToggle').onchange = (ev) => toggleAutoRefresh(ev.target.checked);
+    if ($('refreshTokenBtn')) loadRefresh();
 
     // 双桥控制：区域下拉、模型按区拉取、单侧启停
     $('connRegion').onchange = () => applyConnRegion($('connRegion').value);
@@ -853,6 +1133,16 @@
         alert('两侧端口不能相同');
         return;
       }
+      // 排队重试参数：留空/0 = 默认（2 次 / 30s / 15s）
+      const queue_max_retries = Number($('queueMaxRetriesInput').value || 2);
+      const queue_wait_cap_sec = Number($('queueWaitCapInput').value || 30);
+      const queue_wait_default_sec = Number($('queueWaitDefaultInput').value || 15);
+      if (!(queue_max_retries >= 1 && queue_max_retries <= 10) ||
+          !(queue_wait_cap_sec >= 1 && queue_wait_cap_sec <= 300) ||
+          !(queue_wait_default_sec >= 1 && queue_wait_default_sec <= 300)) {
+        alert('排队重试需在 1–10 次、等待 1–300 秒范围内');
+        return;
+      }
       
       // 处理密码修改逻辑
       const oldPassword1 = ($('oldPassword1').value || '').trim();
@@ -886,7 +1176,7 @@
       $('connMsg').className = 'msg';
       $('connMsg').textContent = '保存中...';
       try {
-        const body = { cn_port, global_port };
+        const body = { cn_port, global_port, queue_max_retries, queue_wait_cap_sec, queue_wait_default_sec };
         body[tokenField] = tokenValue;
         if (passwordData !== null) {
           // 根据类型决定使用哪个字段

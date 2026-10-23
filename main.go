@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -35,7 +36,60 @@ func main() {
 	bind := flag.String("bind", "0.0.0.0", "console bind address")
 	bridgeBind := flag.String("bridge-bind", "0.0.0.0", "两条桥的监听地址；本机自用建议 127.0.0.1，否则同内网任何人都能用你的额度")
 	dataDir := flag.String("data-dir", "", "data root (default: $QODER2API_HOME or ~/.qoder2api)")
+	// [DEPRECATED] 上游旧参数仍可用：--bridge-port 映射到新端口，
+	// --instance 保留旧预设与旧数据目录，避免升级后旧启动脚本/账号“消失”。
+	bridgePortLegacy := flag.Int("bridge-port", 0, "[已弃用] 旧单桥端口；instance=global 时映射 Global，否则映射 CN")
+	instance := flag.String("instance", "", "[已弃用] 预设 cn / global；仅影响端口与旧数据目录")
 	flag.Parse()
+
+	instanceMode := strings.ToLower(strings.TrimSpace(*instance))
+	instanceSet := isFlagPassed("instance") && instanceMode != ""
+	if instanceSet {
+		switch instanceMode {
+		case "cn", "china":
+			if !isFlagPassed("web-port") {
+				*webPort = 3588
+			}
+			if !isFlagPassed("cn-port") && !isFlagPassed("bridge-port") {
+				*cnPort = account.DefaultCNPort
+			}
+			if !isFlagPassed("global-port") {
+				*globalPort = account.DefaultGlobalPort
+			}
+		case "global", "intl", "international":
+			if !isFlagPassed("web-port") {
+				*webPort = 3589
+			}
+			// 旧 global 实例只保留一条桥（8964），CN 侧不启动。
+			if !isFlagPassed("cn-port") {
+				*cnPort = 0
+			}
+			if !isFlagPassed("global-port") && !isFlagPassed("bridge-port") {
+				*globalPort = account.DefaultGlobalPort
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "unknown --instance %q (supported: cn, global); ignored\n", *instance)
+			instanceSet = false
+		}
+	}
+	if isFlagPassed("bridge-port") {
+		if instanceSet && instanceMode != "cn" && instanceMode != "china" {
+			if !isFlagPassed("global-port") {
+				*globalPort = *bridgePortLegacy
+			}
+		} else if !isFlagPassed("cn-port") {
+			*cnPort = *bridgePortLegacy
+		}
+	}
+	if *dataDir == "" && os.Getenv("QODER2API_HOME") == "" && instanceSet {
+		if home, err := os.UserHomeDir(); err == nil {
+			name := ".qoder2api-cn"
+			if instanceMode == "global" || instanceMode == "intl" || instanceMode == "international" {
+				name = ".qoder2api-global"
+			}
+			*dataDir = filepath.Join(home, name)
+		}
+	}
 
 	if *dataDir != "" {
 		account.SetDataRoot(*dataDir)
@@ -50,7 +104,7 @@ func main() {
 	svc.LoadRuntimeSettings()
 
 	// 命令行端口优先于 settings.json（未显式传参时沿用 settings / 默认双桥端口）
-	if isFlagPassed("cn-port") || isFlagPassed("global-port") {
+	if isFlagPassed("cn-port") || isFlagPassed("global-port") || isFlagPassed("bridge-port") || instanceSet {
 		svc.SetPorts(*cnPort, *globalPort)
 	} else {
 		*cnPort, *globalPort = svc.Ports()
@@ -76,6 +130,9 @@ func main() {
 
 	// 每日自动签到调度（需在控制台手动开启，默认关闭）
 	StartCheckinScheduler()
+
+	// token 自动续期调度（默认关闭；开启后每 15 天用 refresh_token 换新 token）
+	StartRefreshScheduler()
 
 	// 启动时两侧各自尽力拉起：一侧没账号绝不阻塞另一侧
 	if err := svc.StartAllBridges(); err != nil {
@@ -113,6 +170,8 @@ func main() {
 	mux.HandleFunc("/api/bridge/start", handleStartBridge)
 	mux.HandleFunc("/api/bridge/stop", handleStopBridge)
 	mux.HandleFunc("/api/checkin", handleCheckin)
+	mux.HandleFunc("/api/refresh", handleRefreshStatus)
+	mux.HandleFunc("/api/refresh/run", handleRefreshRun)
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
 	addr := fmt.Sprintf("%s:%d", *bind, *webPort)
@@ -417,6 +476,15 @@ func handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	if out.CNPort == 0 && out.GlobalPort == 0 {
 		out.CNPort, out.GlobalPort = account.DefaultCNPort, account.DefaultGlobalPort
 	}
+	// 兼容旧客户端：单桥字段映射到 CN 侧（或另一侧启用时取那侧）
+	out.Port = out.CNPort
+	if out.Port == 0 {
+		out.Port = out.GlobalPort
+	}
+	out.BridgeToken = out.CationToken
+	if out.BridgeToken == "" {
+		out.BridgeToken = out.GlobalToken
+	}
 	// 不回传明文控制台密码，只标记是否已设置
 	hasConsolePwd := strings.TrimSpace(out.ConsolePassword) != "" || strings.TrimSpace(os.Getenv("QODER2API_CONSOLE_PASSWORD")) != ""
 	out.ConsolePassword = ""
@@ -440,7 +508,20 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		LogLevel         *string  `json:"log_level"`
 		AutoCheckin      *bool    `json:"auto_checkin"`
 		AutoCheckinTimes []string `json:"auto_checkin_times"`
-		ConsolePassword  *string  `json:"console_password"`
+		AutoRefreshToken *bool    `json:"auto_refresh_token"`
+		// 档位字段用 map/string 单独处理（nil 与空串语义不同：
+		// nil=不修改，""=清空）
+		ContextTierDefault   *string           `json:"context_tier_default"`
+		ContextTierOverrides map[string]string `json:"context_tier_overrides"`
+		// 模型排队重试参数（控制台可配，热更新生效）
+		QueueMaxRetries     *int `json:"queue_max_retries"`
+		QueueWaitCapSec     *int `json:"queue_wait_cap_sec"`
+		QueueWaitDefaultSec *int `json:"queue_wait_default_sec"`
+		// [DEPRECATED] 上游单桥字段：旧客户端只发这两项时做兼容映射。
+		LegacyPort      *int    `json:"port"`
+		LegacyToken     *string `json:"bridge_token"`
+		AutoStart       *bool   `json:"auto_start"`
+		ConsolePassword *string `json:"console_password"`
 		// 新格式：包含旧密码和新密码
 		ConsolePasswordNew *struct {
 			OldPassword string  `json:"old_password"`
@@ -454,6 +535,25 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	cur, err := svc.GetSettings()
 	if err != nil || cur == nil {
 		cur = &account.Settings{CNPort: account.DefaultCNPort, GlobalPort: account.DefaultGlobalPort, LogLevel: "info"}
+	}
+	// 兼容上游单桥客户端的 {port, bridge_token} 请求：未同时给分区字段时，
+	// port 映射到 CN 侧，bridge_token 同时作为两区 key（旧行为是一把共用）。
+	if req.LegacyPort != nil && req.CNPort == nil && req.GlobalPort == nil {
+		if *req.LegacyPort < 1 || *req.LegacyPort > 65535 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid port"))
+			return
+		}
+		cur.CNPort = *req.LegacyPort
+		if cur.GlobalPort == 0 {
+			cur.GlobalPort = account.DefaultGlobalPort
+		}
+	}
+	if req.LegacyToken != nil && req.CationToken == nil && req.GlobalToken == nil {
+		tok := strings.TrimSpace(*req.LegacyToken)
+		if tok == "qccg" {
+			tok = ""
+		}
+		cur.CationToken, cur.GlobalToken = tok, tok
 	}
 	// 端口校验：0=停用该侧，其余必须在合法范围；两侧不能同时停用、也不能撞同一端口
 	validPort := func(p int) bool { return p >= 0 && p <= 65535 }
@@ -499,6 +599,57 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	if req.AutoCheckin != nil {
 		cur.AutoCheckin = *req.AutoCheckin
 		logger.Info("auto checkin set to %v", cur.AutoCheckin)
+	}
+	if req.AutoStart != nil {
+		// 兼容上游旧控制台：仅保存开关，双桥仍按账号自动常驻。
+		cur.AutoStart = *req.AutoStart
+	}
+	if req.AutoRefreshToken != nil {
+		cur.AutoRefreshToken = *req.AutoRefreshToken
+		logger.Info("auto refresh token set to %v", cur.AutoRefreshToken)
+	}
+	if req.ContextTierDefault != nil {
+		cur.ContextTierDefault = strings.TrimSpace(*req.ContextTierDefault)
+		logger.Info("context tier default set to %q", cur.ContextTierDefault)
+	}
+	if req.ContextTierOverrides != nil {
+		over := map[string]string{}
+		for k, v := range req.ContextTierOverrides {
+			k = strings.TrimSpace(k)
+			v = strings.TrimSpace(v)
+			if k == "" || v == "" {
+				continue
+			}
+			over[k] = v
+		}
+		cur.ContextTierOverrides = over
+		logger.Info("context tier overrides set: %v", over)
+	}
+	if req.QueueMaxRetries != nil {
+		v := *req.QueueMaxRetries
+		if v < 1 || v > 10 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("queue_max_retries 需在 1~10 之间"))
+			return
+		}
+		cur.QueueMaxRetries = v
+	}
+	if req.QueueWaitCapSec != nil {
+		v := *req.QueueWaitCapSec
+		if v < 1 || v > 300 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("queue_wait_cap_sec 需在 1~300 之间"))
+			return
+		}
+		cur.QueueWaitCapSec = v
+	}
+	if req.QueueWaitDefaultSec != nil {
+		v := *req.QueueWaitDefaultSec
+		if v < 1 || v > 300 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("queue_wait_default_sec 需在 1~300 之间"))
+			return
+		}
+		cur.QueueWaitDefaultSec = v
+		logger.Info("queue retry set: maxRetries=%d waitCap=%ds waitDefault=%ds",
+			cur.QueueMaxRetries, cur.QueueWaitCapSec, cur.QueueWaitDefaultSec)
 	}
 	if req.AutoCheckinTimes != nil {
 		var times []string
@@ -555,6 +706,8 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// 排队重试参数热更新（无需重启）
+	svc.ApplyQueueSettings(cur.QueueMaxRetries, cur.QueueWaitCapSec, cur.QueueWaitDefaultSec)
 	safe := *cur
 	safe.ConsolePassword = ""
 	writeJSON(w, http.StatusOK, map[string]interface{}{

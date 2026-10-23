@@ -7,6 +7,9 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=build /out/qoder2api /app/qoder2api
+# 以非 root 运行；/data 是账号、secret、日志与设置目录
+RUN mkdir -p /data && chown 10001:10001 /data
+USER 10001:10001
 # 3588 控制台 · 8963 国内版桥 · 8964 国际版桥
 EXPOSE 3588 8963 8964
 ENV HOME=/data

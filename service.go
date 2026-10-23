@@ -27,6 +27,8 @@ type QoderModel struct {
 	MaxOutputTokens int     `json:"max_output_tokens,omitempty"`
 	MaxInputTokens  int     `json:"max_input_tokens,omitempty"`
 	PriceFactor     float64 `json:"price_factor,omitempty"`
+	// ContextTiers 上游 context_config 的全部档位（如 200K/400K/1M）。
+	ContextTiers []bridge.ContextTier `json:"context_tiers,omitempty"`
 }
 
 // regionBridge 把「端口 + 账号池 + 区域」三者绑成一个常驻单元。
@@ -76,6 +78,13 @@ func (s *Service) LoadRuntimeSettings() {
 	s.globalToken = settings.GlobalToken
 	s.cnPort = settings.CNPort
 	s.globalPort = settings.GlobalPort
+	// 排队重试参数（控制台可配）：启动时应用，保存设置时再热更新
+	bridge.ApplyQueueSettings(settings.QueueMaxRetries, settings.QueueWaitCapSec, settings.QueueWaitDefaultSec)
+}
+
+// ApplyQueueSettings 热更新模型排队重试参数（控制台保存设置后调用，即时生效）。
+func (s *Service) ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec int) {
+	bridge.ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec)
 }
 
 // SetPorts 设置两侧的对外端口（命令行覆盖 settings）。
@@ -248,6 +257,36 @@ func (s *Service) GetStatus() account.Status {
 			bs.AccountsTotal = usable
 		}
 		out.Bridges = append(out.Bridges, bs)
+	}
+	// 兼容上游单桥状态字段：旧控制台/脚本仍读 running/port/active_account。
+	// 本 fork 里 8963 固定是 CN、8964 固定是 Global；单桥字段优先 CN，
+	// CN 未启用时回落到 Global，保证「只跑国际版」的旧客户端也读得到。
+	out.Port = s.cnPort
+	if out.Port == 0 {
+		out.Port = s.globalPort
+	}
+	out.Running = false
+	for _, bs := range out.Bridges {
+		if bs.Running {
+			out.Running = true
+		}
+		if bs.Region == account.RegionGlobal {
+			out.GlobalRunning = bs.Running
+		}
+	}
+	if cn, _ := account.GetActiveForRegion(account.RegionCN); cn != nil {
+		out.ActiveAccount = cn.ID
+		out.APIMode = cn.APIMode
+		out.CNActive = cn.ID
+		out.CNActiveName = cn.Name
+	}
+	if gl, _ := account.GetActiveForRegion(account.RegionGlobal); gl != nil {
+		out.GlobalActive = gl.ID
+		out.GlobalActiveName = gl.Name
+		if out.ActiveAccount == "" {
+			out.ActiveAccount = gl.ID
+			out.APIMode = gl.APIMode
+		}
 	}
 	return out
 }
@@ -452,6 +491,7 @@ func (s *Service) syncPool(region account.Region, pool *bridge.Pool) (int, error
 	}
 	desired := map[string]string{} // id -> secret
 	names := map[string]string{}
+	fps := map[string]*account.CheckinFingerprint{}
 	for i := range accounts {
 		a := accounts[i]
 		if !account.HasSecret(a.ID) {
@@ -464,6 +504,7 @@ func (s *Service) syncPool(region account.Region, pool *bridge.Pool) (int, error
 		}
 		desired[a.ID] = sec
 		names[a.ID] = a.Name
+		fps[a.ID] = a.CheckinFingerprint
 	}
 
 	changed := 0
@@ -478,7 +519,7 @@ func (s *Service) syncPool(region account.Region, pool *bridge.Pool) (int, error
 		if pool.Has(id) {
 			continue
 		}
-		slot, err := bridge.NewSlotFromSecret(id, names[id], region, sec)
+		slot, err := bridge.NewSlotFromSecretWithFP(id, names[id], region, sec, fps[id])
 		if err != nil {
 			logger.Error("syncPool(%s): account %s unusable, skipped: %v", region, id, err)
 			continue
@@ -522,7 +563,7 @@ func (s *Service) buildRegionPool(region account.Region) *bridge.Pool {
 			logger.Error("buildRegionPool(%s): get secret for %s: %v", region, a.Name, err)
 			continue
 		}
-		slot, err := bridge.NewSlotFromSecret(a.ID, a.Name, a.Region, pat)
+		slot, err := bridge.NewSlotFromSecretWithFP(a.ID, a.Name, a.Region, pat, a.CheckinFingerprint)
 		if err != nil {
 			logger.Error("buildRegionPool(%s): account %s unusable, skipped: %v", region, a.Name, err)
 			continue
@@ -736,6 +777,7 @@ func (s *Service) ListQoderModels(region account.Region) ([]QoderModel, error) {
 			PriceFactor:     m.PriceFactor,
 			ContextWindow:   m.ContextWindow,
 			MaxOutputTokens: m.MaxOutputTokens,
+			ContextTiers:    m.ContextTiers,
 		}
 	}
 	return out, nil

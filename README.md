@@ -9,6 +9,72 @@
 [![Go](https://img.shields.io/badge/Go-1.27+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/License-见原项目-blue)](https://github.com/wangtufly/QCCG/blob/main/LICENSE)
 
+> ## 🆕 2026-10-23 · 本轮新增模型：Sonus / Cantus / Fast
+>
+> 通过**新版推理协议**（`cosy-clienttype=10` / `cosy-version=1.1.69` + **真实设备指纹**），
+> 国际版账号模型清单由 13 → **15** 个，新增三档：
+>
+> | Key | 模型 | 定位 | 上下文 | 最大输出 | 倍率 | 推理 |
+> |-----|------|------|--------|----------|------|:----:|
+> | `smodel` | **Sonus** | 顶级旗舰 · 最贵 · 热门时段常排队 | 200,000 | 32,768 | **8** | ✅ |
+> | `cmodel` | **Cantus** | 高能力主力档 | 200,000 | 32,768 | **4** | ✅ |
+> | `fast` | **Fast** | 低延迟快速档 | 200,000 | 16,384 | 0.8 | — |
+>
+> - 三档均需账号在 `accounts/*.json` 配置 `checkin_fingerprint`（真实设备指纹）后走新版协议才会出现并可推理；未配置的账号仍是旧版 13 模型清单，行为不变。
+> - **Sonus 倍率 8 为全表最高**，用的人多，上游高频返回 `10605 isQueued`（排队中）——属容量问题，稍后重试或换模型即可。
+> - 详见下方「更新记录 · 新版推理协议解锁 Sonus / Cantus / Fast」。
+
+---
+
+## 📖 [2026-10-20 更新] Qoder 注册链路逆向研究 · 阶段性成果
+
+> 独立研究文档 → **[docs/registration-research/README.md](docs/registration-research/README.md)**（点击查看完整报告）
+
+本轮对 Qoder **Web 端注册流程**做了完整协议还原，主要发现：
+
+| # | 发现 | 说明 |
+|---|---|---|
+| 1 | **真注册接口** | `POST /api/v1/users`（不是 `/users/sign-up`，后者只是前端路由）|
+| 2 | **两轮人机验证** | ① AliyunCaptcha 2.0 滑块（scene `1r7eif79x`）② 阿里 baxia 风控 + 3×3 网格点选（`RGV587` 触发）|
+| 3 | **baxia 可完整解析** | iframe 同源可访问，WASM 解密后经 `putImageData` 写 canvas，**`getImageData` 直接读到明文图片**（样本图片见 `artifacts/baxia/`）|
+| 4 | **★ 设备↔账号绑定** | App 登录会打开 `/device/selectAccounts?nonce=` → 「继续使用此账户吗？」→ 服务端按设备维护账号关联表 |
+| 5 | **★ 权益消失机制** | 网页注册可拿到 **300 积分 + Pro Trial**；同设备登录 App 后消失 → 与 `machineid = f(IOPlatformSerialNumber)` 的设备识别一致（见 `../resetfree/`）|
+| 6 | **剩余卡点** | 题目文字为 anti-OCR 像素图（tesseract 全败），需多模态视觉识别；`bx-ua` 指纹算法未解 |
+
+**欢迎社区接力**：多模态识别方案 / baxia `bx-ua` 算法 / 设备绑定接口细节。
+
+### 🧰 配套工具包
+
+本轮沉淀的可复用工具已整理到 **[tools/qoder-register-kit/](tools/qoder-register-kit/README.md)**：
+
+| 工具 | 用途 |
+|---|---|
+| `cdp.js` | **CDP 驱动**：拟人鼠标轨迹（贝塞尔曲线+抖动）、逐键输入、随机延迟。所有脚本的地基 |
+| `incog.js` | **无痕上下文管理**：规避登录态重定向；每次失败后重建，避免 React/baxia 状态污染 |
+| `mailbox.py` | **临时邮箱客户端**：建地址 → 收信 → 提取 6 位验证码（`x-admin-auth` + Bearer JWT）|
+| `detect_gap.py` | **滑块缺口检测**：拼图块不透明像素做模板匹配，输出缺口 x 坐标 |
+| `flows/page-submit.js` | **注册第 1 步**：填姓名/邮箱 → 提交。含 antd Form 实例绕过（`__reactFiber$` + `setFieldsValue`）|
+| `flows/step2-submit.js` | **注册第 2 步**：填密码 → 提交 → 触发滑块 |
+| `flows/solve-slider6.js` | **滑块自动求解**：缺口检测 + 三段式闭环拖拽（实测拼图/手柄比例 ≈0.91）|
+| `flows/type-code.js` | **填邮箱验证码**：6 位逐键输入 + 调 `onChangeCallback` 触发提交 |
+| `flows/watch-baxia2.js` | **等待 baxia 弹窗**：轮询 punish iframe 是否展示 |
+| `flows/analyze-baxia.js` | **baxia 只读分析**：导出题目图 + 9 张网格图（iframe 同源，无需逆向 WASM）|
+| `flows/capture-success.js` | **全量网络存档**：请求/响应/`bx-ua` 指纹 → JSONL，用于抓人工成功样本 |
+| `flows/net-observe.js` | **单次请求定位**：不确定按钮调什么接口时，一次看清 URL 与 body |
+
+### ⚠️ 协助者注意事项
+
+1. **合规**：本工具包仅供**协议研究与学习**；请勿用于批量注册、绕过风控或商业化滥用，
+   并遵守目标站点服务条款与当地法律法规。
+2. **不要提交凭证**：admin passkey、账号密码、`bx-ua` 指纹等**禁止入库**；
+   抓包存档提交前必须脱敏。
+3. **保持人类节奏**：`cdp.js` 内置随机延迟与拟人轨迹，请勿移除——高频请求会触发风控，
+   也会影响其他人的研究。
+4. **可回滚**：所有实验仅在浏览器无痕上下文内进行，不改动系统配置与硬件信息。
+5. **提交前自检**：`git diff` 确认无凭证、无 `node_modules`、无个人数据。
+
+> ⚠️ 研究性质声明：仅做协议与机制分析，不提供绕过验证的成品工具。
+
 ---
 
 ## 🔀 本 fork（Capricornus007）：国内版 + 国际版**同时可用**
@@ -52,6 +118,12 @@
 
 感谢 [@LeonardW-sl](https://github.com/LeonardW-sl) 的持续贡献与代码质量（含单元测试覆盖）。欢迎更多社区朋友参与共建。
 
+### 其他贡献者
+
+| 贡献者 | 贡献 | 说明 |
+|------|-----|------|
+| [@SDCOM-0415](https://github.com/SDCOM-0415) | **定位 `--instance=global` 端口被覆盖 Bug** | 发现 `ensureConsolePassword()` 首次启动写盘默认 `port:8963` 覆盖 `--instance=global` 预设的 `8964`，并给出修复方向（见[更新记录](#-修复-instanceglobal-的-bridge-端口被-settings-默认值冲成-8963)） |
+
 ---
 
 ## ✨ 新功能：每日签到领 100 Credits
@@ -85,18 +157,79 @@
 
 - **权威签到走 `campaigns`**：这是唯一真实发放积分的接口，返回 `grantId` 可核验到账
 - **不依赖 `daily-check-in`**：该 legacy 端点在国内已 `DISABLED` 且对未领取日恒返回 `409`（会误判为已领取而漏领），海外则直接 `404`
-- **⚠️ 必须携带完整设备指纹**：国际版（`qoder.com`）的签到活动**按设备指纹下发**——
-  请求若缺少 `cosy-version` / `cosy-machineid` / `cosy-machinetoken` / `cosy-machinetype` /
-  `cosy-machinecode` / `cosy-machinehostname` / `cosy-machineos` 这 7 个头，
-  服务端会**不下发 `CLAIM_BENEFIT` 签到活动**，表现为「无可用签到活动」而无法领取。
-  本项目复用 Bridge 的同一套 `cosy.FingerprintSeed` 派生规则（uid 优先、凭证兜底），
-  保证签到与推理在同一账号上表现为同一台物理设备
-- **账号准入**：服务端按账号状态灰度下发签到活动。实测新注册账号（如当天创建）
-  即使携带完整指纹也不下发活动，需账号有一定使用记录后才可见
+
+#### ⚠️ 设备指纹政策（重要）
+
+国际版（`qoder.com`）的签到活动**按真实设备身份下发**。缺指纹时服务端不下发
+`CLAIM_BEFEFIT` 活动，表现为「无可用签到活动」（`no_campaign`）。
+该结论由社区 A/B 实验验证（[issue #4](https://github.com/Zhengyuuuui/qoder2api/issues/4)，
+对照 [yetone/magpie#1268](https://github.com/yetone/magpie/issues/1268)）：
+补入 `cosy-machinetoken` + `cosy-machinetype` 后活动立即出现，移除任一字段活动消失。
+
+**自造指纹无效**：`cosy-machinetoken` 由官方客户端本地生成，客户端无法自造（实测任意自造值均被拒）。
+必须使用官方客户端的真实指纹。
+
+| 区域 | 指纹要求 |
+|------|---------|
+| `cn`（`openapi.qoder.com.cn`） | 通常**不需要** |
+| `global`（`openapi.qoder.sh`） | **首次领取前必须携带**真实指纹 |
+
+**懒下发机制**：Global 账号在官方客户端**首次领取一次后**，服务端转为「懒下发」——
+之后即使不带指纹，`campaigns` 也能查到该活动。所以新账号需先用官方客户端领一次，
+或在 qoder2api 中配置指纹。
+
+**配置方式**：在账号 JSON 中添加 `checkin_fingerprint` 字段：
+
+```json
+{
+  "id": "acct_xxx",
+  "name": "your-global-account",
+  "region": "global",
+  "checkin_fingerprint": {
+    "machine_id": "6ba86f67-4909-4a9a-9567-c289d999f0c1",
+    "machine_token": "<cosy-machinetoken>",
+    "machine_type": "<cosy-machinetype>",
+    "machine_code": "<可选，cosy-machinecode>",
+    "hostname": "localhost",
+    "machine_os": "aarch64_darwin",
+    "version": "0.4.4"
+  }
+}
+```
+
+**获取指纹**：
+
+```bash
+# 自动读取 machine_id（明文文件），并给出 token/type 的获取指引
+./scripts/extract_fingerprint.sh global
+```
+
+`machine_id` 存放在客户端明文中：
+`~/Library/Application Support/com.qoder.app.stable/auth.machine-id`（macOS）
+
+`machine_token` / `machine_type` 存于**加密**文件 `auth.v1.dat`（非标准密钥保护，无法离线解密），
+需通过抓包获取：
+
+```bash
+# 1. 启动抓包
+mitmdump -q -s scripts/capture_addon.py -p 8080
+# 2. 开启代理
+./scripts/proxy_toggle.sh on
+# 3. 打开官方客户端 →「用量面板 → 礼物图标」触发活动加载
+# 4. 关闭代理
+./scripts/proxy_toggle.sh off
+# 5. 从 scripts/capture/ 中取 URL 含 /sash/api/v1/me/campaigns 的请求头，
+#    复制 cosy-machinetoken / cosy-machinetype / cosy-version
+```
+
+#### 其他行为
+
 - **领取窗口**：`10:00 → 次日 09:59 (UTC+8)`，窗口未开启时点击会明确提示下次开放时间
 - **连续天数本地统计**：上游 legacy 统计恒为 0，故由 qoder2api 记录 `checkin_history.json` 并按**活动窗口 `startAt` 日期**（而非自然日）计算，避免 10:00 前误记
 - **调度容错**：签到时刻若活动尚未下发，不标记当日完成，每分钟重试至 12:00，避免漏签
 - **多时段支持**：`auto_checkin_times` 可配置多个 `HH:MM` 时间点（贡献者 `fcde08e`）
+- **排查辅助**：`no_campaign` 时日志会打印该账号是否带指纹、活动类型列表与原始响应，
+  便于定位是「缺指纹」还是「服务端未下发」
 
 **手动签到 API**：
 
@@ -120,6 +253,50 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 
 ---
 
+## ✨ 新功能：Token 自动续期（15 天）
+
+账号的 access token 与 refresh token 均有有效期。此前 bridge **只保存 refresh_token 却从不使用它**，
+一旦两个 token 双双过期，账号会静默失效（控制台额度显示为空、请求 `401 TOKEN_EXPIRE`），只能重新走 OAuth。
+
+本功能利用 Qoder jobToken 端点的 `needRefresh` 模式（传入 `drt-` 前缀的 refresh_token，服务端签发新
+access token 并回传新的 refresh_token）在过期前**主动续期**。
+
+- **⏰ 定时续期**：默认**关闭**，开启后每 6 小时检查一次；token 年龄 ≥ 12 天自动续期（间隔 15 天，留 3 天余量）
+- **🖱️ 手动续期**：控制台「续期 Token」按钮一键续期；「强制续期」忽略年龄窗口
+- **📊 状态可见**：账号表格新增「Token 续期」列，显示 token 年龄、状态徽章、失败原因、下次续期日期
+- **🔀 多模式兼容**：
+  - OAuth 账号：优先用 `refresh_token`（同时拿到新 at + rt），无 rt 时回退 `device_token`
+  - PAT 账号：跳过（每次请求实时交换，无需续期）
+  - 无 secret 账号：跳过
+- **🔁 续期后需重启 Bridge**：续期写入新的 secret 文件，重启后生效（界面会提示）
+
+### 使用方式
+
+控制台「账号列表 / 额度」区域新增一行控制条：
+
+```
+[续期 Token]  [☑ 自动续期(15天)]  [强制续期]   每 15 天自动续期（token 满 12 天触发）
+```
+
+对应接口：
+
+| 接口 | 说明 |
+|------|------|
+| `GET /api/refresh` | 续期状态（开关、间隔、各账号 token 年龄、上次结果） |
+| `POST /api/refresh/run` | 手动续期（跳过未满 12 天的账号） |
+| `POST /api/refresh/run?force=1` | 强制续期全部账号 |
+
+### 续期失败的常见原因
+
+| 报错 | 原因 | 处理 |
+|------|------|------|
+| `personal token is invalid` | refresh_token 本身已过期 | 只能重新 OAuth / PAT 授权 |
+| `TOKEN_EXPIRE` | device_token 已过期但 rt 仍有效 | 续期会自动处理 |
+| `secret 中既无 refresh_token 也无 device_token` | 早期版本只存了 PAT | 重新添加账号 |
+
+> ⚠️ 本功能是**预防性**的：若 token 已彻底死亡（at 和 rt 同时失效），续期无法救回，
+> 必须重新授权。建议开启自动续期避免再次发生。
+
 ## 更新记录
 
 ### 🏗️ 架构（本 fork）：双桥常驻 —— 国内版与国际版**同时可用**
@@ -141,7 +318,7 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 | `account/model.go` | `Status{Bridges []BridgeStatus}`（含 `pool_size` / `accounts_total` / `reason`）；`Settings.Port` → `CNPort` + `GlobalPort` |
 | `internal/bridge/pool.go` | 新增 `Remove/Has/IDs`，供池成员热退出 |
 | `internal/bridge/bridge_pool.go` | 删除未钉区域的 `NewPoolBridge`；`pickSlotForModel` 的区域判定不再从池内「猜」首个 slot |
-| `main.go` | `--bridge-port`/`--instance` → `--cn-port`/`--global-port`（单数据目录 `~/.qoder2api`）；端口冲突与双零校验；`/api/bridge/{start,stop}?region=`、`/api/models?region=`；`connectionInfo` 输出两区 base URL |
+| `main.go` | 推荐 `--cn-port`/`--global-port`（单数据目录 `~/.qoder2api`）；`--bridge-port`/`--instance` 作为**兼容别名**保留，旧脚本仍可用（`--instance=global` 继续读旧目录 `~/.qoder2api-global`）；端口冲突与双零校验；`/api/bridge/{start,stop}?region=`、`/api/models?region=`；`connectionInfo` 输出两区 base URL |
 | `webconsole/index.html` | 状态卡改双桥（每侧 ON/OFF、端口、可用号/池内号、激活号、单侧启停按钮与未上线原因）；接入卡加区域下拉、双端口输入、另一侧 URL 提示；模型卡按区拉取 |
 | `qoder2api.service` / `qoder2api.openrc` | 一份 systemd 单位（旧的 cn/global 两份 unit 删除）＋ OpenRC runscript，供 Artix 这类无 systemd 环境常驻 |
 | `account/model.go`·`service.go`·`main.go` | API Key 拆成 `cn_token` / `global_token`（各留空回落 `qccg`），鉴权中间件按所在区域取自己那把；新增 `--bridge-bind`，两条桥不再硬绑 `0.0.0.0` |
@@ -154,6 +331,315 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 停 CN 不打扰 Global 仍在服务、端口撞车被挡、删号热退出池、连接信息两区齐备）、
 `internal/bridge/pool_test.go`（钉区域的桥永不派别区号、同区内按目录选号、`Remove` 行为）。
 单测不再触碰真实上游（原先 `go test ./internal/bridge` 会打 `api2.qoder.sh`，现已隔绝）。
+
+### 🎚️ 新增：Context 多档位支持（200K / 400K / 1M）
+
+**2026-10-23**
+
+上游 `model/list` 的 `context_config` 按模型提供多档 context，但 bridge 此前只取
+`is_default` 那一档（通常 200K），导致 400K / 1M 档位在 `/v1/models` 中不可见，
+App 端能选到的大 context 在 bridge 侧完全丢失。
+
+**改动**：
+
+| 文件 | 内容 |
+|------|------|
+| `internal/bridge/bridge.go` | `QoderModel` 新增 `ContextTiers`；`parseQoderModels` 保留全部档位；新增 `resolveContextTokens` / `contextTierTokens` / `modelCatalog`（5 分钟缓存）|
+| `internal/bridge/context_tier_test.go` (新增) | 档位解析、排序、默认档回退、大小写不敏感等用例 |
+| `account/model.go` | `Settings` 新增 `context_tier_default` 与 `context_tier_overrides` |
+| `service.go` | `ListQoderModels` 透出 `context_tiers` |
+| `main.go` | settings 保存支持档位字段 |
+| `webconsole/index.html` | 模型表格新增「可用档位」列；模型区新增档位下拉与保存按钮 |
+
+**使用**：控制台「模型」区域顶部选择档位（如 `400K`），保存后对该实例所有模型生效；
+留空 = 用上游默认档。请求时把所选 token 数写入 `model_config.max_input_tokens`。
+
+> ⚠️ **未证实**：上游 `context_config` 的结构已从抓包确认，但「App 端用哪个请求字段
+> 传递所选档位」尚未抓到真实模型请求验证。当前按最可能的 `model_config.max_input_tokens`
+> 实现（该字段已存在于请求模板）。若实测不生效，需抓一次 App 的
+> `agent_chat_generation` 请求确认字段名。
+
+**实测档位分布**（`scripts/capture/` 抓包，15 个模型中 12 个有三档）：
+
+| 模型 | 档位 |
+|------|------|
+| `qmodel_38max` / `qfmodel` / `dmodel` / `dfmodel` / `gfmodel` 等 | 200K / 400K / 1M |
+| `ultimate` / `fast` / `smodel` / `cmodel` 等 | 200K / 400K / 1M |
+| `auto` / `efficient` | 仅 200K |
+
+
+### 🔁 改进：模型排队改为「同账号等待重试 + 友好提示」（2026-10-23）
+
+**2026-10-23 CST**
+
+热门模型（如 Sonus，倍率 8）被大量占用时，上游返回 `10605 isQueued`（带 `queueCount` /
+`retryAfterSeconds`）。此前桥接把它误判为「无权限」（RESOURCE_LIMIT），于是**换号 + 冷却全部账号**，
+最终回 `no_available_account` 直接报错断开——而换号对同模型同队列毫无帮助。
+
+**改动**：
+
+| 文件 | 内容 |
+|------|------|
+| `internal/bridge/errors.go` | `isQueued`/`retryAfterSeconds` 一律判为**可重试拥塞**（`upstream_queued`）；消息含「前方排队人数 + 预计等待秒数」；新增 `isUpstreamQueue` / `queueRetryAfter` |
+| `internal/bridge/pool.go` | `ShouldFailover` 对队列错误返回 **false**（不换号、不冷却） |
+| `internal/bridge/bridge.go` | `streamWithSlot` 外层新增**同账号排队重试**：等待 `retryAfterSeconds`（夹在 1s~30s）后重试，最多 2 次 |
+
+**新行为**：
+
+- 命中排队 → **在原账号上等待 ~30s 重试**（最多 2 次，共 ~60s），撑到队列疏通常能成功；
+  期间不切换、不冷却账号，其他模型不受影响。
+- 仍未疏解 → 返回友好错误（HTTP 503）：`模型 X 当前使用人数较多，正在排队（前方约 N 人），
+  预计还需等待约 M 秒…`，客户端稍后重试或改用其他模型即可。
+
+> 排队重试参数**控制台可配、热更新生效**（`NewAPI / 中转站接入` 卡片 → 「模型排队重试」）：
+> **最多重试次数**（默认 2，范围 1~10）、**单次等待上限**（默认 30s，范围 1~300）、
+> **默认等待**（上游未给 retryAfter 时，默认 15s）。实际单次等待 = `min(上游 retryAfterSeconds, 等待上限)`。
+> 保存后即时生效，无需重启。
+
+### 🆕 新增：新版推理协议解锁 Sonus / Cantus / Fast（2026-10-23）
+
+**2026-10-23 CST**
+
+上游按 `(cosy-clienttype, cosy-version)` 决定下发哪套模型清单。桥接此前固定用旧协议
+（`clienttype=5` / `version=1.0.10` + 派生指纹），只能拿到 13 个模型，官方桌面端首选的
+**Sonus / Cantus / Fast** 三档不可见、无法转发。
+
+**改动**：为账号引入「真实设备指纹 → 新版推理协议」开关。
+
+| 文件 | 内容 |
+|------|------|
+| `account/model.go` | `CheckinFingerprint` 扩展 `client_ip` / `client_type` / `version` / `scene` / `product` / `data_policy` 字段 |
+| `internal/bridge/client.go` | `BearerClient` 新增 `fp`；`buildHeaders` 按是否配置真实指纹切换新旧协议头 |
+| `internal/bridge/bridge.go` | 新增 `NewBridgeWithFP`，指纹非空时启用新版协议 |
+| `internal/bridge/bridge_pool.go` | 新增 `NewSlotFromSecretWithFP` |
+| `service.go` | `buildRegionPool` 读取账号 JSON 的 `checkin_fingerprint` 并下传 |
+
+**机制**：账号 `accounts/*.json` 配置 `checkin_fingerprint`（`machine_id` = `machine_token` = `client_ip`，取自官方客户端抓包）后，该账号请求头切换为：
+
+- `cosy-clienttype: 10` / `cosy-version: 1.1.69` / `user-agent: undici`
+- `cosy-business-product: app` / `cosy-scene: app` / `cosy-data-policy: agree`
+- 真实 `cosy-machineid` / `cosy-machinetoken` / `cosy-clientip`
+
+`model/list` 随即从 13 → **15** 个，新增下列三档；**未配置指纹的账号行为完全不变**（旧协议、旧清单、零回归）。
+
+| Key | 模型 | 上下文 | 最大输出 | 倍率 | 推理 |
+|-----|------|--------|----------|------|:----:|
+| `smodel` | **Sonus** | 200,000 | 32,768 | **8** | ✅ |
+| `cmodel` | **Cantus** | 200,000 | 32,768 | **4** | ✅ |
+| `fast` | **Fast** | 200,000 | 16,384 | 0.8 | — |
+
+> ⚠️ **Sonus 倍率 8 为全表最高，热门时段上游返回 `10605 isQueued`（排队中）**——这是容量/占用
+> 问题，非鉴权或协议问题；稍后重试或改用其他模型即可。Cantus / Fast 为同批下发的通用档。
+>
+> ✅ **回归验证**：新版协议不影响普通模型（`qfmodel` 等）推理；以纯 HEAD 基线对照确认无回归。
+
+### 🔐 新增：Token 自动续期（15 天）
+
+**2026-10-21**
+
+修复「账号 token 过期后静默失效」问题：bridge 早前只保存 `refresh_token` 却从未使用，
+双 token 同时过期后只能重新走 OAuth。
+
+**改动**：
+
+| 文件 | 内容 |
+|------|------|
+| `refresh.go` (新增) | 续期核心逻辑 + 调度器 + HTTP handlers |
+| `account/model.go` | `Settings` 新增 `auto_refresh_token` 字段 |
+| `account/secret.go` | 导出 `SecretPathFor()`（供 token 年龄判断） |
+| `main.go` | 注册 `/api/refresh` 路由 + 启动调度器 + settings 支持 |
+| `webconsole/index.html` | 账号表格新增「Token 续期」列 + 续期控制条 |
+
+**机制**：调用已有的 `cosy.ExchangeJobToken` 并传入 `drt-` 前缀 token 触发 `needRefresh` 模式，
+服务端返回新的 access token 与 refresh token。token 年龄 ≥ 12 天触发（间隔 15 天）。
+
+**调度**：默认关闭；开启后每 6 小时检查一次，启动时延迟 45s 先跑一次让控制台有状态。
+
+**测试覆盖**：死号（401 明确报错）/ PAT 模式（跳过）/ 无 secret（跳过）/ 新 token（跳过）/
+开关持久化（重启后保持）。
+
+### 🌐 国际版签到的账号差异（灰度投放）
+
+**2026-10-20 CST**
+
+国际版（`qoder.com`）的活动是**按账号灰度投放**的，不同账号拿到的活动**不重叠**。实测两个账号：
+
+| | `yusheng zheng`（老号） | `tmpreg gep`（新号） |
+|---|---|---|
+| 注册时间 / 方式 | 2026-07-29 · `sso.google` | 2026-10-11 · `dashboard.email_pwd` |
+| **每日签到**（每天 100 Credits） | ✅ 可正常自动签到 | ❌ 服务端未下发 |
+| **SOTA 专属积分**（2000，限 Sonus 模型） | ❌ 未下发 | ✅ 已领取 |
+
+两点结论：
+
+1. **老号签到正常，但没有 SOTA 专属积分** —— 自动签到只覆盖「每日签到」这一类活动
+2. **新号无签到，但有 SOTA 积分** —— 用新号的 SOTA 包 ID 给老号代领会返回
+   `CAMPAIGN_NOT_FOUND`（服务端校验活动归属），说明这是运营灰度，不是接口或指纹问题
+
+> 即：**自动签到能领的活动范围，取决于服务端给该账号下发了什么**。
+> qoder2api 只负责把已下发的 `CLAIM_BENEFIT` 活动自动领掉，无法代领未下发的活动。
+
+#### 官方 App 中的 SOTA 专属积分
+
+![国际版 App 的 SOTA 专属积分面板](docs/img/sota-credits-app.jpg)
+
+#### qoder2api 控制台展示效果
+
+![qoder2api 控制台账号额度列表](docs/img/console-account-packages.jpg)
+
+### 📋 模型总表（国际版 2026-10-23 实拉 · 国内版 2026-10-22 实拉）
+
+模型清单由上游 `GET /algo/api/v2/model/list` 在运行时动态拉取，下方为当时快照，仅供对照；
+实际以 `/v1/models` 返回为准。`price_factor` 为相对倍率，`0` 表示限免。
+
+> ⚠️ 同一 key 在**两区的推理支持与最大输出可能不同**（上游按区配置），故分表列出。
+> 国际版下表为**新版推理协议账号**（配置真实指纹）快照；旧协议账号仍为 13 模型清单。
+
+#### 国内版 · 11 个（Bridge `8963`）
+
+| Key | 显示名 | 上下文 | 最大输出 | 倍率 | 推理 |
+|-----|--------|--------|----------|------|:----:|
+| `auto` | Auto | 200,000 | 32,768 | 0.5 | ✅ |
+| `qmodel_38max` | Qwen3.8-Max | 200,000 | 32,768 | **0.2** | ✅ |
+| `qfmodel` | Qwen3.8-Flash | 200,000 | 32,768 | **0** 🆓 | ✅ |
+| `qmodel` | Qwen3.7-Plus | 200,000 | 32,768 | 0.1 | ✅ |
+| `dmodel` | DeepSeek-V4-Pro | 200,000 | 32,768 | **0.5** | ✅ |
+| `dfmodel` | DeepSeek-Flash | 200,000 | 16,384 | **0** 🆓 | — |
+| `gmodel` | GLM-5.3 | 200,000 | 32,768 | **0.8** | ✅ |
+| `gfmodel` | GLM-5.3-Flash | 200,000 | 32,768 | 0.1 | ✅ |
+| `kmodel_latest` | Kimi-K3 | 200,000 | 16,384 | **1.4** | — |
+| `kmodel` | Kimi-K2.8-Preview | 200,000 | 32,768 | **0.8** | ✅ |
+| `mmodel` | **MiniMax-M3.1-Flash** | 200,000 | 16,384 | 0.1 | — |
+
+#### 国际版 · 15 个（Bridge `8964` · 新版推理协议账号）
+
+| Key | 显示名 | 上下文 | 最大输出 | 倍率 | 推理 |
+|-----|--------|--------|----------|------|:----:|
+| `auto` | Auto | 200,000 | 16,384 | 0.5 | — |
+| `ultimate` | Ultimate | 200,000 | 32,768 | 2 | ✅ |
+| `efficient` | Efficient | 200,000 | 16,384 | 0.3 | — |
+| `qmodel_38max` | Qwen3.8-Max | 200,000 | 32,768 | 0.5 | ✅ |
+| `qfmodel` | Qwen3.8-Flash | 200,000 | 32,768 | **0** 🆓 | ✅ |
+| `dmodel` | DeepSeek-V4-Pro | 200,000 | 32,768 | 0.5 | ✅ |
+| `dfmodel` | DeepSeek-Flash | 200,000 | 32,768 | **0** 🆓 | ✅ |
+| `gmodel` | GLM-5.3 | 200,000 | 32,768 | 0.8 | ✅ |
+| `gfmodel` | GLM-5.3-Flash | 200,000 | 16,384 | 0.1 | ✅ |
+| `kmodel_latest` | Kimi-K3 | 200,000 | 16,384 | 1.4 | — |
+| `kmodel` | Kimi-K2.8-Preview | 200,000 | 16,384 | 0.8 | — |
+| `mmodel` | MiniMax-M3.1-Flash | 200,000 | 16,384 | 0.1 | — |
+| `smodel` | **Sonus** 🆕 | 200,000 | 32,768 | **8** | ✅ |
+| `cmodel` | **Cantus** 🆕 | 200,000 | 32,768 | **4** | ✅ |
+| `fast` | **Fast** 🆕 | 200,000 | 16,384 | 0.8 | — |
+
+> 🆕 = 本轮（2026-10-23）新增；倍率为该快照账号实测，可能随账号档位/活动浮动。
+
+**区域差异速览**
+
+| 差异 | 详情 |
+|------|------|
+| 国际独占 | `ultimate` / `efficient`；新版协议账号额外独占 `smodel`(Sonus) / `cmodel`(Cantus) / `fast` |
+| 推理标记不同 | `auto` / `kmodel` 国内支持、国际不支持；`dfmodel` 反之 |
+| 最大输出不同 | 多数模型国内 32,768、国际 16,384；`dfmodel` 相反 |
+
+> 🆓 = 限免（倍率 0）；🆕 = 本轮（2026-10-23）新增。倍率可能随账号档位/活动浮动。
+
+#### ✅ SOTA「Sonus」模型已可通过新版推理协议访问（2026-10-23 更正）
+
+> 本节此前的结论「Sonus 不通过 `model/list` 下发、API 侧不可见」**已过时**，特此更正。
+
+持有 **SOTA 专属积分**的账号，官方 App 的模型选择器里会多出一个 **Sonus** 模型
+（积分说明：选择 Sonus 时优先抵扣该积分）。此前实测它不走默认协议的下发，是因为桥接用的是
+旧协议（`clienttype=5` / `version=1.0.10`）。
+
+**2026-10-23 复测**：同一账号（`tmpreg gep`）改用**新版推理协议**
+（`clienttype=10` / `version=1.1.69` + 真实设备指纹）后，`model/list` 直接下发
+**Sonus(`smodel`)**，并连同 **Cantus(`cmodel`)** / **Fast(`fast`)** 一起进入清单（13 → 15 个）。
+配置方法见上方[更新记录 · 新版推理协议](#-新增新版推理协议解锁-sonus--cantus--fast2026-10-23)。
+
+> ⚠️ Sonus 倍率 8 为全表最高、占用高，热门时段上游返回 `10605 isQueued`（排队中）——
+> 属容量问题，稍后重试或改用其他模型即可，并非鉴权或协议失败。
+
+### 🔄 上游模型清单更新
+
+**2026-10-20 CST** · 模型列表为运行时动态拉取（`/algo/api/v2/model/list`），无需改代码；以下仅作变更留档。
+
+**国内版（14 个）**
+
+| Key | 显示名 | 变化 |
+|-----|--------|------|
+| `mmodel` | **MiniMax-M3.1-Flash** | 🔄 更名（原 MiniMax-M2.7） |
+| `qmodel_38max` | Qwen3.8-Max | 💰 price 0.5 → **0.2**（降价） |
+| `dmodel` | DeepSeek-V4-Pro | 💰 price 0.8 → **0.5**（降价） |
+| `gmodel` | GLM-5.3 | 💰 price 0.6 → **0.8**（涨价） |
+| `kmodel` | Kimi-K2.8-Preview | 💰 price 0.3 → **0.8**（涨价） |
+| `kmodel_latest` | Kimi-K3 | 💰 price 0.8 → **1.4**（涨价） |
+| `dfmodel` | DeepSeek-Flash | 🆓 price=**0**（免费） |
+| `qfmodel` | Qwen3.8-Flash | 🆓 price=**0**（限免活动延续） |
+
+**国际版（15 个）**：比国内多 `ultimate` / `performance`（ctx **272K**，最大）/ `efficient` 三个独占档位；
+国内独有 `q37fmodel`（Qwen3.7-Flash）与 `gm51model`（GLM-5.2）。
+
+> ⚠️ `mmodel` 只是**显示名**变化，key 未变，已有调用与映射无需调整。
+> 若在控制台手工配过 `ModelMappings` 且使用了旧显示名，请改为 key。
+
+### 🐛 修复：`--instance=global` 的 Bridge 端口被 settings 默认值冲成 8963
+
+**2026-10-16 14:25 CST** · 由社区贡献者 [@SDCOM-0415](https://github.com/SDCOM-0415) 定位
+
+**问题现象**
+
+按 README 使用 `./qoder2api --instance global` 启动，文档承诺 Bridge 端口为 `8964`，
+实际却监听 `8963`；`ss -tlnp | grep 8964` 无结果，按 8964 接入的客户端全部连不上。
+
+**根因**
+
+`ensureConsolePassword()` 在**首次启动**时会 `LoadSettings()`（无 `settings.json` 时返回默认
+`Port=8963`），把 `{port:8963, console_password:...}` **写盘**，并同步
+`svc.bridgePort = cur.Port`。这一步发生在 `--instance` 预设端口应用**之后**，
+于是 `--instance=global` 预设的 `8964` 被静默覆盖回 `8963`，且无任何端口相关日志。
+
+> 注：并非 `LoadRuntimeSettings()` 的问题——`main.go` 在其后已用 `*bridgePort` 修正过，
+> 真正冲掉的是随后执行的 `ensureConsolePassword()`。
+
+**修复**
+
+- `auth.go`：`ensureConsolePassword()` 只同步 `BridgeToken`，**不再覆盖** `svc.bridgePort`
+- `main.go`：把端口最终裁决移到 `ensureConsolePassword()` **之后**，并明确优先级：
+  `显式 --instance 预设 > 显式端口 flag > settings.json > 内置默认`
+
+**验证（全新数据目录）**
+
+| 启动参数 | 修复前 | 修复后 | 说明 |
+|---|---|---|---|
+| `--instance=global` | ❌ `8963` | ✅ `8964` | 本 Bug 主场景 |
+| `--instance=cn` | `8963` | ✅ `8963` | 回归 |
+| `--bridge-port=9999` | `9999` | ✅ `9999` | 显式 flag 优先（`9999` 仅为测试用任意端口） |
+| 无端口参数（默认 cn） | `8963` | ✅ `8963` | 回归 |
+
+> 表中 `9999` 是验证"显式 `--bridge-port` 是否优先生效"所用的**任意空闲测试端口**，
+> 并非项目默认或推荐端口。生产请使用默认 `8963`（CN）/ `8964`（Global）。
+
+---
+
+### 📌 签到设备指纹政策（Global 需真实官方指纹）
+
+**2026-10-16 CST** · 关联 [issue #4](https://github.com/Zhengyuuuui/qoder2api/issues/4) · 对照 [yetone/magpie#1268](https://github.com/yetone/magpie/issues/1268)
+
+国际版账号签到恒为 `no_campaign` 的根因与处理方式：
+
+- **根因**：`campaigns` 接口需要**真实**的 `cosy-machinetoken` + `cosy-machinetype`
+  （官方客户端本地持有），缺失时服务端不下发 `CLAIM_BEFEFIT` 活动。
+  A/B 实验：补入后活动出现，移除任一字段活动消失
+- **自造指纹无效**：`cosy-machinetoken` 由客户端本地生成且受服务端校验，
+  任意自造值（含正确长度/格式）都会被拒 → 此前 `7702e28` 移除自造指纹方向正确但不完整
+- **指纹不是登录下发的**：实测 `deviceToken/poll`、`deviceToken/refresh` 响应中
+  均无这些字段，需从客户端本地或抓包获取
+- **懒下发**：Global 账号在官方客户端首次领取后，之后不带指纹也能查到活动——
+  解释了「同一控制台内有的 Global 号正常、有的恒 no_campaign」
+- **实现**：新增账号级 `checkin_fingerprint` 配置（`account/model.go`），
+  `checkinHeaders` 有指纹才附带、无指纹只发必要头（CN 行为）
+- **工具**：新增 `scripts/extract_fingerprint.sh`（读取明文 `machine_id` 并给出抓包指引）；
+  `no_campaign` 时日志打印指纹状态、活动类型与原始响应，便于排查
 
 ### 🏗️ 架构：单控制台 + 双桥端口（CN 8963 / Global 8964）
 
@@ -339,6 +825,39 @@ callQoder: account=yusheng zheng id=zysgm... region=global failed, failing over 
 
 > 只想跑单侧：`--global-port=0`（只留国内版）或 `--cn-port=0`（只留国际版）。
 > 想同一台机器再开一套独立实例：换 `--data-dir` 与三个端口即可，不再需要 `--instance`。
+
+## Docker 部署
+
+### 本地构建运行
+
+需要安装 Docker Engine 与 Docker Compose：
+
+```bash
+docker compose up -d --build
+```
+
+控制台位于 `http://localhost:3588`，Bridge 端口为 `8963`（CN）和 `8964`（Global）。账号、密钥与设置保存在 Compose 命名卷 `qoder2api-data` 中；可通过环境变量 `QODER2API_CONSOLE_PASSWORD` 指定控制台密码，留空则首次启动时自动生成并保存。
+
+查看运行日志或停止服务：
+
+```bash
+docker compose logs -f
+docker compose down
+```
+
+### 点击按钮构建并推送到 GHCR
+
+在 GitHub 仓库打开 **Actions → Build and publish Docker image → Run workflow**，输入要发布的镜像标签并运行。工作流会构建 `linux/amd64` 和 `linux/arm64`，推送输入标签以及对应的 `sha-<commit>` 标签到：
+
+```text
+ghcr.io/<仓库所有者>/qoder2api:<tag>
+```
+
+镜像命名空间由工作流的 `GITHUB_REPOSITORY` 自动推导（例如本仓库发布到 `ghcr.io/zhengyuuuui/qoder2api`），fork 后无需改动即可发布到自己账号下。工作流使用仓库的 `GITHUB_TOKEN`，无需额外配置推送密钥。首次发布后，可在仓库 **Packages** 中调整镜像可见性；拉取公开镜像示例：
+
+```bash
+docker pull ghcr.io/zhengyuuuui/qoder2api:latest
+```
 
 ## 快速开始
 

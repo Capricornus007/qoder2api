@@ -2,10 +2,13 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -173,5 +176,194 @@ func TestRetryBackoffSchedule(t *testing.T) {
 	// 生产退避节奏：第 1 次 1s、第 2 次 2s（与 hub 一致）
 	if RetryBackoff(1).Seconds() != 1 || RetryBackoff(2).Seconds() != 2 {
 		t.Errorf("backoff schedule = %v, %v", RetryBackoff(1), RetryBackoff(2))
+	}
+}
+
+// nestedResourceLimitDetail 构造上游三层嵌套业务错误报文（RESOURCE_LIMIT）。
+//
+// 上游把业务错误嵌在 message 字段里，每嵌一层就做一次 JSON 字符串编码：
+//
+//	outer.message = json(mid)      // mid 的引号变成 \"
+//	mid.message   = json(inner)    // inner 的引号变成 \"
+//
+// 因此用 json.Marshal 逐层编码最可靠（避免手写转义出错）。
+func nestedResourceLimitDetail(isQueued bool, serviceAvailable bool, queueCount int) string {
+	// 排队时才带 retryAfterSeconds/waitTime；未排队（无权限）则为 0。
+	wait := 0
+	if isQueued {
+		wait = 30
+	}
+	inner := fmt.Sprintf(
+		`{"isQueued":%v,"modelKey":"qfmodel","queueCount":%d,`+
+			`"queueType":"p3","retryAfterSeconds":%d,"serviceAvailable":%v,`+
+			`"subCode":"RESOURCE_LIMIT","waitTime":%d}`,
+		isQueued, queueCount, wait, serviceAvailable, wait)
+
+	mid := fmt.Sprintf(
+		`{"code":"10605","message":%s,"subCode":"RESOURCE_LIMIT"}`,
+		mustJSONString(inner))
+
+	outer := fmt.Sprintf(
+		`{"code":"403","message":%s}`,
+		mustJSONString(mid))
+
+	return "upstream 403: " + outer
+}
+
+// mustJSONString 把任意字符串编码成 JSON 字符串字面量（含两端双引号）。
+func mustJSONString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+func TestParseUpstreamNestedError_ResourceLimit(t *testing.T) {
+	detail := nestedResourceLimitDetail(true, false, 0)
+	d, ok := parseUpstreamNestedError(detail)
+	if !ok {
+		t.Fatalf("should parse nested RESOURCE_LIMIT error, detail=%s", detail)
+	}
+	if d.ModelKey != "qfmodel" {
+		t.Errorf("ModelKey = %q, want qfmodel", d.ModelKey)
+	}
+	if d.SubCode != "RESOURCE_LIMIT" {
+		t.Errorf("SubCode = %q, want RESOURCE_LIMIT", d.SubCode)
+	}
+	if d.ServiceAvailable {
+		t.Error("ServiceAvailable should be false")
+	}
+	if d.RetryAfterSeconds != 30 {
+		t.Errorf("RetryAfterSeconds = %d, want 30", d.RetryAfterSeconds)
+	}
+}
+
+func TestParseUpstreamNestedError_NotNested(t *testing.T) {
+	for _, detail := range []string{
+		"",
+		"upstream 500: internal error",
+		`{"code":"403","message":"forbidden"}`,
+		`{"error":"something else"}`,
+	} {
+		if _, ok := parseUpstreamNestedError(detail); ok {
+			t.Errorf("parseUpstreamNestedError(%q) should fail", detail)
+		}
+	}
+}
+
+func TestFriendlyUpstreamError_ResourceLimit(t *testing.T) {
+	// 未排队且服务不可用（无 retryAfter）：账号无权使用该模型（确定性拒绝）
+	detail := nestedResourceLimitDetail(false, false, 0)
+	msg, et := FriendlyUpstreamError(403, detail)
+	if et != ErrTypeResourceLimit {
+		t.Errorf("errType = %q, want %q", et, ErrTypeResourceLimit)
+	}
+	if !strings.Contains(msg, "qfmodel") {
+		t.Errorf("message should mention model key, got: %s", msg)
+	}
+	if !strings.Contains(msg, "不可用") {
+		t.Errorf("message should explain unavailability, got: %s", msg)
+	}
+	if got := ErrorStatus(NewUpstreamError(403, detail)); got != 403 {
+		t.Errorf("ErrorStatus = %d, want 403", got)
+	}
+}
+
+func TestFriendlyUpstreamError_UpstreamQueued(t *testing.T) {
+	// serviceAvailable=true：上游拥塞排队，稍后重试可能成功
+	detail := nestedResourceLimitDetail(true, true, 3)
+	msg, et := FriendlyUpstreamError(403, detail)
+	if et != ErrTypeUpstreamQueue {
+		t.Errorf("errType = %q, want %q", et, ErrTypeUpstreamQueue)
+	}
+	if !strings.Contains(msg, "排队") {
+		t.Errorf("message should mention queueing, got: %s", msg)
+	}
+	if !strings.Contains(msg, "30") {
+		t.Errorf("message should mention wait time, got: %s", msg)
+	}
+	if got := ErrorStatus(NewUpstreamError(403, detail)); got != 503 {
+		t.Errorf("ErrorStatus = %d, want 503", got)
+	}
+}
+
+func TestFriendlyUpstreamError_QueuedServiceUnavailable(t *testing.T) {
+	// 用户实况：热门模型被挤爆——isQueued=true 但 serviceAvailable=false 且带 retryAfter。
+	// 这属于「排队拥塞」而非「无权限」，必须判为可重试的 upstream_queued（否则会被
+	// 误判成 RESOURCE_LIMIT 而冷却全部账号、直接报错断开）。
+	detail := nestedResourceLimitDetail(true, false, 5)
+	msg, et := FriendlyUpstreamError(403, detail)
+	if et != ErrTypeUpstreamQueue {
+		t.Errorf("errType = %q, want %q", et, ErrTypeUpstreamQueue)
+	}
+	for _, want := range []string{"排队", "5" /* 前方约 5 人 */, "30" /* 预计等 30 秒 */} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message should contain %q, got: %s", want, msg)
+		}
+	}
+	if got := ErrorStatus(NewUpstreamError(403, detail)); got != 503 {
+		t.Errorf("ErrorStatus = %d, want 503", got)
+	}
+}
+
+func TestShouldFailover_Queue(t *testing.T) {
+	// 排队换号无益（同模型同队列）：不应换号、不应冷却账号。
+	detail := nestedResourceLimitDetail(true, false, 5)
+	if ShouldFailover(NewUpstreamError(403, detail)) {
+		t.Error("queue error should NOT failover")
+	}
+}
+
+func TestQueueRetryAfter(t *testing.T) {
+	// 上游 retryAfter=30 在 cap 内 → 30s
+	err := NewUpstreamError(403, nestedResourceLimitDetail(true, false, 0))
+	if got := queueRetryAfter(err); got != 30*time.Second {
+		t.Errorf("queueRetryAfter = %v, want 30s", got)
+	}
+	// 非队列错误 → 默认等待
+	if got := queueRetryAfter(NewUpstreamError(500, "boom")); got != QueueWaitDefault {
+		t.Errorf("queueRetryAfter(non-queue) = %v, want %v", got, QueueWaitDefault)
+	}
+	// 无 isQueued 的权限类错误 → 默认等待（不会被当成队列）
+	perm := NewUpstreamError(403, nestedResourceLimitDetail(false, false, 0))
+	if isUpstreamQueue(perm) {
+		t.Error("permission error must not be classified as queue")
+	}
+}
+
+func TestApplyQueueSettings(t *testing.T) {
+	omr, owc, owd := QueueMaxRetries, QueueWaitCap, QueueWaitDefault
+	defer func() { QueueMaxRetries, QueueWaitCap, QueueWaitDefault = omr, owc, owd }()
+
+	// 全 0 → 各自默认
+	ApplyQueueSettings(0, 0, 0)
+	if QueueMaxRetries != DefaultQueueMaxRetries ||
+		QueueWaitCap != DefaultQueueWaitCapSec*time.Second ||
+		QueueWaitDefault != DefaultQueueWaitDefSec*time.Second {
+		t.Errorf("defaults not applied: %d %v %v", QueueMaxRetries, QueueWaitCap, QueueWaitDefault)
+	}
+	// 正常值透传
+	ApplyQueueSettings(5, 10, 8)
+	if QueueMaxRetries != 5 || QueueWaitCap != 10*time.Second || QueueWaitDefault != 8*time.Second {
+		t.Errorf("custom not applied: %d %v %v", QueueMaxRetries, QueueWaitCap, QueueWaitDefault)
+	}
+	// 超上限夹取
+	ApplyQueueSettings(99, 9999, 9999)
+	if QueueMaxRetries != maxQueueRetriesCeiling ||
+		QueueWaitCap != maxQueueWaitCeilingSec*time.Second ||
+		QueueWaitDefault != maxQueueWaitCeilingSec*time.Second {
+		t.Errorf("clamp failed: %d %v %v", QueueMaxRetries, QueueWaitCap, QueueWaitDefault)
+	}
+}
+
+func TestFriendlyUpstreamError_Plain403Unchanged(t *testing.T) {
+	// 普通 403 不走嵌套解析，保持原有行为
+	msg, et := FriendlyUpstreamError(403, "access denied")
+	if et != ErrTypeUpstream {
+		t.Errorf("errType = %q, want %q", et, ErrTypeUpstream)
+	}
+	if !strings.Contains(msg, "upstream 403") {
+		t.Errorf("message = %q, want upstream 403 prefix", msg)
 	}
 }

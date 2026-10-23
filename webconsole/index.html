@@ -143,6 +143,33 @@
       border-left: 2px solid #4caf50;
       margin-top: 0;
     }
+    /* 账号列表按 region 分组的标题行 */
+    .region-row td {
+      background: #f0efec;
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: .04em;
+      color: #444;
+      border-top: 2px solid #d6d3cc;
+      border-bottom: 1px solid var(--line);
+      padding: 8px;
+    }
+    .region-row .region-tag {
+      display: inline-block;
+      padding: 1px 8px;
+      border-radius: 4px;
+      background: #444;
+      color: #fff;
+      margin-right: 8px;
+      font-size: 11px;
+    }
+    .region-row .region-tag.gl { background: #1a7f37; }
+    .region-row .region-active {
+      color: var(--muted);
+      font-weight: 400;
+      letter-spacing: 0;
+      margin-left: 8px;
+    }
     .bar {
       height: 5px;
       background: #eee;
@@ -351,10 +378,12 @@
     function setStatus(running, extra = {}) {
       $('statusDot').classList.toggle('on', !!running);
       $('statusText').textContent = running ? 'Bridge running' : 'Bridge stopped';
+      // 单控制台双桥：分别展示 CN 8963 与 Global 8964 的运行/启用状态
+      const cnOn = !!running;
+      const glOn = extra.global_running !== false && !!running;
       $('statusMeta').innerHTML = `
-        <span class="pill">Bridge: ${running ? 'ON' : 'OFF'}</span>
-        <span class="pill">Port: ${extra.port || 8963}</span>
-        <span class="pill">Active: ${extra.active_account || '-'}</span>
+        <span class="pill">CN 8963: ${cnOn ? 'ON' : 'OFF'} · 启用 ${extra.cn_active_name || extra.cn_active || '无'}</span>
+        <span class="pill">Global 8964: ${glOn ? 'ON' : 'OFF'} · 启用 ${extra.global_active_name || extra.global_active || '无'}</span>
         <span class="pill">API: ${extra.api_mode || '-'}</span>
       `;
     }
@@ -580,7 +609,8 @@
         $('accountBody').innerHTML = '<tr><td colspan="5" class="muted">暂无账号</td></tr>';
         return;
       }
-      $('accountBody').innerHTML = list.map(a => {
+      // 单行渲染（与原逻辑一致，仅把「激活」改为「启用」）
+      const rowHtml = (a) => {
         const cachedQuota = quotaCache[a.id];
         const slot = poolById[a.id];
         const coolMs = slot ? (slot.cooling_remaining_ms || 0) : 0;
@@ -594,7 +624,7 @@
         return `
         <tr data-id="${a.id}">
           <td>
-            <div><strong>${a.name || a.id}</strong> ${a.active ? '<span class="pill">active</span>' : ''} ${poolBadge}</div>
+            <div><strong>${a.name || a.id}</strong> ${a.active ? '<span class="pill">启用</span>' : ''} ${poolBadge}</div>
             <div class="muted">${a.email || '-'}</div>
             ${poolNote}
           </td>
@@ -605,14 +635,29 @@
           <td class="quota-cell" data-quota-id="${a.id}">${renderQuota(cachedQuota)}</td>
           <td data-refresh-id="${a.id}">${renderRefreshCell(a.id)}</td>
           <td class="row">
-            <button class="secondary" data-act="activate" data-id="${a.id}" ${a.active ? 'disabled' : ''}>激活</button>
+            <button class="secondary" data-act="activate" data-id="${a.id}" ${a.active ? 'disabled' : ''}>启用</button>
             <button class="secondary" data-act="quota" data-id="${a.id}">刷新额度</button>
             <button class="secondary" data-act="checkin" data-id="${a.id}">🎁 签到</button>
             <button class="secondary" data-act="cool" data-id="${a.id}">冷却</button>
             <button class="danger" data-act="delete" data-id="${a.id}">删除</button>
           </td>
         </tr>
-      `}).join('');
+      `};
+      // 按 region 分区（cn 在前、global 在后），组间插入醒目标题行
+      const norm = (r) => (r === 'cn' || r === 'CN') ? 'cn' : 'global';
+      const groups = [
+        { tag: 'CN', cls: '',   title: '国内版 · Bridge 8963', arr: list.filter(a => norm(a.region) === 'cn') },
+        { tag: 'GLOBAL', cls: 'gl', title: '国际版 · Bridge 8964', arr: list.filter(a => norm(a.region) === 'global') },
+      ];
+      let html = '';
+      for (const g of groups) {
+        if (!g.arr.length) continue;
+        const act = g.arr.find(a => a.active);
+        const activeTxt = act ? (act.name || act.id) : '无（点击账号行「启用」）';
+        html += `<tr class="region-row"><td colspan="5"><span class="region-tag ${g.cls}">${g.tag}</span>${g.title}<span class="region-active">启用账号：${activeTxt}</span></td></tr>`;
+        html += g.arr.map(rowHtml).join('');
+      }
+      $('accountBody').innerHTML = html;
     }
 
     // ===== Token 续期 =====

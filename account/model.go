@@ -86,11 +86,20 @@ type Settings struct {
 	AutoCheckinTimes     []string                     `json:"auto_checkin_times,omitempty"`     // 自动签到时间点，HH:MM 列表，如 ["09:15","17:00"]；空=10:00
 	AutoRefreshToken     bool                         `json:"auto_refresh_token"`               // 自动续期 token 开关（默认关闭）；开启后每 15 天用 refresh_token 换新 token
 	ContextTierDefault   string                       `json:"context_tier_default,omitempty"`   // 全局默认 context 档位名（如 "400K"）；空=用上游默认档
-	ContextTierOverrides map[string]string            `json:"context_tier_overrides,omitempty"`  // 按模型 key 覆盖档位：model_key -> 档位名
+	ContextTierOverrides map[string]string            `json:"context_tier_overrides,omitempty"` // 按模型 key 覆盖档位：model_key -> 档位名
 	MachineSalt          string                       `json:"machine_salt,omitempty"`           // 本机设备指纹盐（首次启动自动生成；勿修改，变更即指纹漂移）
 	QueueMaxRetries      int                          `json:"queue_max_retries,omitempty"`      // 模型排队（上游 10605 isQueued）同账号最多重试次数；≤0 用默认 2，范围 1~10
 	QueueWaitCapSec      int                          `json:"queue_wait_cap_sec,omitempty"`     // 单次排队等待上限（秒）；≤0 用默认 30，范围 1~300
 	QueueWaitDefaultSec  int                          `json:"queue_wait_default_sec,omitempty"` // 上游未给 retryAfter 时的默认等待（秒）；≤0 用默认 15，范围 1~300
+	QueueWaitFirstToken  *bool                        `json:"queue_wait_first_token,omitempty"` // 排队时「首字前一直等」；nil=用默认(true)。true=直到出首字或客户端断开才停（忽略重试次数）；false=按 queue_max_retries 封顶
+}
+
+// EffectiveQueueWaitFirstToken 返回排队「首字前一直等」的有效值；未设置（nil）时默认开（true）。
+func (s *Settings) EffectiveQueueWaitFirstToken() bool {
+	if s.QueueWaitFirstToken != nil {
+		return *s.QueueWaitFirstToken
+	}
+	return true
 }
 
 type QuotaInfo struct {

@@ -333,23 +333,24 @@ func TestQueueRetryAfter(t *testing.T) {
 }
 
 func TestApplyQueueSettings(t *testing.T) {
-	omr, owc, owd := QueueMaxRetries, QueueWaitCap, QueueWaitDefault
-	defer func() { QueueMaxRetries, QueueWaitCap, QueueWaitDefault = omr, owc, owd }()
+	omr, owc, owd, oft := QueueMaxRetries, QueueWaitCap, QueueWaitDefault, QueueWaitFirstToken
+	defer func() { QueueMaxRetries, QueueWaitCap, QueueWaitDefault, QueueWaitFirstToken = omr, owc, owd, oft }()
 
 	// 全 0 → 各自默认
-	ApplyQueueSettings(0, 0, 0)
+	ApplyQueueSettings(0, 0, 0, false)
 	if QueueMaxRetries != DefaultQueueMaxRetries ||
 		QueueWaitCap != DefaultQueueWaitCapSec*time.Second ||
-		QueueWaitDefault != DefaultQueueWaitDefSec*time.Second {
-		t.Errorf("defaults not applied: %d %v %v", QueueMaxRetries, QueueWaitCap, QueueWaitDefault)
+		QueueWaitDefault != DefaultQueueWaitDefSec*time.Second ||
+		QueueWaitFirstToken != false {
+		t.Errorf("defaults not applied: %d %v %v %v", QueueMaxRetries, QueueWaitCap, QueueWaitDefault, QueueWaitFirstToken)
 	}
-	// 正常值透传
-	ApplyQueueSettings(5, 10, 8)
-	if QueueMaxRetries != 5 || QueueWaitCap != 10*time.Second || QueueWaitDefault != 8*time.Second {
-		t.Errorf("custom not applied: %d %v %v", QueueMaxRetries, QueueWaitCap, QueueWaitDefault)
+	// 正常值透传（含开关）
+	ApplyQueueSettings(5, 10, 8, true)
+	if QueueMaxRetries != 5 || QueueWaitCap != 10*time.Second || QueueWaitDefault != 8*time.Second || QueueWaitFirstToken != true {
+		t.Errorf("custom not applied: %d %v %v %v", QueueMaxRetries, QueueWaitCap, QueueWaitDefault, QueueWaitFirstToken)
 	}
 	// 超上限夹取
-	ApplyQueueSettings(99, 9999, 9999)
+	ApplyQueueSettings(99, 9999, 9999, false)
 	if QueueMaxRetries != maxQueueRetriesCeiling ||
 		QueueWaitCap != maxQueueWaitCeilingSec*time.Second ||
 		QueueWaitDefault != maxQueueWaitCeilingSec*time.Second {

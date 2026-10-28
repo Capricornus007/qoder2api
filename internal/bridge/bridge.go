@@ -592,25 +592,52 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 // 返回是否已向 onDelta 发出过内容——上层据此决定能否换号（已发出内容则不能，
 // 否则客户端会收到重复内容）。
 func (b *Bridge) streamWithSlot(ctx context.Context, slot *Slot, qurl string, body map[string]interface{}, extra map[string]string, onDelta func(Delta)) (bool, error) {
+	model := modelKeyFromBody(body)
 	queueTries := 0
-	for {
-		emitted, err := b.streamWithTransientRetry(ctx, slot, qurl, body, extra, onDelta)
-		if err == nil {
-			return emitted, nil
-		}
-		// 队列拥塞且尚未发出内容：同账号等待重试（不换号）
-		if !emitted && isUpstreamQueue(err) && queueTries < QueueMaxRetries {
-			queueTries++
-			wait := queueRetryAfter(err)
-			logger.Info("upstream queued (model congested), waiting %s before retry on same account (try %d/%d): %v",
-				wait, queueTries, QueueMaxRetries, err)
-			if serr := sleepCtx(ctx, wait); serr != nil {
-				return emitted, err // ctx 取消/超时：上抛最后一次错误
-			}
-			continue
+	totalWait := time.Duration(0)
+	// finish 记录本次排队片段（仅当确实发生过排队）；outcome 见 WaitOutcome*。
+	finish := func(outcome string, emitted bool, err error) (bool, error) {
+		if queueTries > 0 {
+			RecordWait(model, slot.Name, string(slot.Region), outcome, queueTries, totalWait)
 		}
 		return emitted, err
 	}
+	for {
+		emitted, err := b.streamWithTransientRetry(ctx, slot, qurl, body, extra, onDelta)
+		if err == nil {
+			return finish(WaitOutcomeSuccess, emitted, nil)
+		}
+		// 队列拥塞且尚未发出内容：同账号等待重试（不换号——同模型同队列）
+		if !emitted && isUpstreamQueue(err) {
+			// 封顶判定：开关 ON=首字前一直等（仅 ctx 取消停止）；OFF=按 QueueMaxRetries
+			if !QueueWaitFirstToken && queueTries >= QueueMaxRetries {
+				logger.Info("upstream queued, gave up after %d tries (~%s): %v", queueTries, totalWait, err)
+				return finish(WaitOutcomeGaveUp, emitted, err)
+			}
+			wait := queueRetryAfter(err)
+			logger.Info("upstream queued (model congested), waiting %s before retry on same account (try %d, waited ~%s): %v",
+				wait, queueTries+1, totalWait, err)
+			if serr := sleepCtx(ctx, wait); serr != nil {
+				// ctx 取消/超时：上抛最后一次错误
+				return finish(WaitOutcomeCancelled, emitted, err)
+			}
+			totalWait += wait
+			queueTries++
+			continue
+		}
+		// 非队列错误：若之前排过队，按 error 记录
+		return finish(WaitOutcomeError, emitted, err)
+	}
+}
+
+// modelKeyFromBody 从请求体取出模型 key（model_config.key），用于等待记录。
+func modelKeyFromBody(body map[string]interface{}) string {
+	if mc, ok := body["model_config"].(map[string]interface{}); ok {
+		if k, ok := mc["key"].(string); ok {
+			return k
+		}
+	}
+	return ""
 }
 
 // streamWithTransientRetry 在单个账号上执行「SSE 信封重试闸门」。

@@ -79,12 +79,17 @@ func (s *Service) LoadRuntimeSettings() {
 	s.cnPort = settings.CNPort
 	s.globalPort = settings.GlobalPort
 	// 排队重试参数（控制台可配）：启动时应用，保存设置时再热更新
-	bridge.ApplyQueueSettings(settings.QueueMaxRetries, settings.QueueWaitCapSec, settings.QueueWaitDefaultSec)
+	bridge.ApplyQueueSettings(settings.QueueMaxRetries, settings.QueueWaitCapSec, settings.QueueWaitDefaultSec, settings.EffectiveQueueWaitFirstToken())
 }
 
 // ApplyQueueSettings 热更新模型排队重试参数（控制台保存设置后调用，即时生效）。
-func (s *Service) ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec int) {
-	bridge.ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec)
+func (s *Service) ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec int, waitFirstToken bool) {
+	bridge.ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec, waitFirstToken)
+}
+
+// RecentWaitLog 返回最近排队等待记录（最新在前），供控制台「最近等待记录」面板使用。
+func (s *Service) RecentWaitLog() []bridge.WaitEpisode {
+	return bridge.RecentWaitLog()
 }
 
 // SetPorts 设置两侧的对外端口（命令行覆盖 settings）。

@@ -108,6 +108,7 @@ type Settings struct {
 	QueueMaxRetries      int                          `json:"queue_max_retries,omitempty"`      // 模型排队（上游 10605 isQueued）同账号最多重试次数；≤0 用默认 2，范围 1~10
 	QueueWaitCapSec      int                          `json:"queue_wait_cap_sec,omitempty"`     // 单次排队等待上限（秒）；≤0 用默认 30，范围 1~300
 	QueueWaitDefaultSec  int                          `json:"queue_wait_default_sec,omitempty"` // 上游未给 retryAfter 时的默认等待（秒）；≤0 用默认 15，范围 1~300
+	QueueWaitFirstToken  *bool                        `json:"queue_wait_first_token,omitempty"` // 排队时「首字前一直等」；nil=用默认(true)。true=直到出首字或客户端断开才停（忽略重试次数）；false=按 queue_max_retries 封顶
 
 	// [DEPRECATED] 上游单桥时代的字段，仅用于读取旧 settings.json 并迁移，
 	// 保存时会被清空；新代码一律使用 CNPort/GlobalPort 与 CationToken/GlobalToken。
@@ -116,6 +117,14 @@ type Settings struct {
 	// AutoStart 是上游旧控制台的开机自启开关；本 fork 双桥按账号自动常驻，
 	// 该字段仅保留读写兼容，不影响运行行为。
 	AutoStart bool `json:"auto_start,omitempty"`
+}
+
+// EffectiveQueueWaitFirstToken 返回排队「首字前一直等」的有效值；未设置（nil）时默认开（true）。
+func (s *Settings) EffectiveQueueWaitFirstToken() bool {
+	if s.QueueWaitFirstToken != nil {
+		return *s.QueueWaitFirstToken
+	}
+	return true
 }
 
 type QuotaInfo struct {
